@@ -1,36 +1,68 @@
 """
 =================================================================================
- MED LIFE PHARMACY - Pharmacy Management System
- Location: Chachkoir, Khalifa Para, Gurudaspur, Natore
+ MED LIFE PHARMACY - ERP System (Purchase / Sales / Inventory / Supplier Ledger)
  Built with: Streamlit + Supabase (supabase-py)
 =================================================================================
 
-SUPABASE TABLE SCHEMA (create these tables in your Supabase project before running):
+SUPABASE TABLE SCHEMA (must already exist in your Supabase project):
 
-1) medicines
+1) master_medicines   (a master catalogue used only for auto-suggest during purchase)
    - id                bigint, primary key, identity
-   - name               text, not null
+   - brand_name         text, not null
+   - company_name       text
    - generic_name       text
-   - shelf_no           text
-   - purchase_price     numeric, not null, default 0
-   - selling_price      numeric, not null, default 0
-   - stock_quantity     numeric, not null, default 0
-   - expiry_date        date
+   - form               text            e.g. Tablet, Syrup, Capsule, Injection
+
+2) medicines           (the live inventory table)
+   - id                bigint, primary key, identity
+   - name               text, not null, unique   (recommended: add a UNIQUE constraint)
+   - medicine_type      text                       e.g. Tablet, Syrup, Injection...
+   - stock              integer, not null, default 0
    - created_at         timestamptz, default now()
 
-2) sales
+3) purchases           (every purchase/stock-in transaction, cash or credit)
    - id                bigint, primary key, identity
+   - purchase_date      date, not null
+   - medicine_name      text, not null
+   - medicine_type      text
+   - supplier_name      text, not null
+   - purchase_unit      text            'Box' or 'Pcs' — how it was purchased
+   - box_quantity        integer, nullable   number of boxes/cartons (only when purchase_unit = 'Box')
+   - units_per_box       integer, nullable   pcs inside each box (only when purchase_unit = 'Box')
+   - quantity           integer, not null    TOTAL PCS added to stock (Box × Units-per-Box, or direct pcs)
+   - payment_type       text            'Cash' or 'Credit'
+   - total_amount       numeric, not null, default 0
+   - paid_amount        numeric, not null, default 0
+   - due_amount         numeric, not null, default 0
+   - created_at         timestamptz, default now()
+
+   NOTE ON UNITS: Medicines are usually PURCHASED in Box/Carton but SOLD in individual Pcs.
+   To keep inventory math simple and accurate, the `medicines.stock` column always stores
+   the quantity in PCS. When you purchase by Box, the app asks for "Number of Boxes" and
+   "Pcs per Box", multiplies them automatically, and adds that total to stock in pcs.
+
+4) supplier_ledger     (running credit balance owed to each supplier/company)
+   - id                bigint, primary key, identity
+   - supplier_name      text, not null, unique
+   - total_due          numeric, not null, default 0
+   - updated_at         timestamptz, default now()
+
+5) sales               (one row PER INVOICE/VOUCHER — a customer may buy many products in one sale)
+   - id                bigint, primary key, identity
+   - voucher_no         text, not null, unique   e.g. MLP-20260917-143205-482
    - sale_date          date, not null
    - customer_name      text
    - customer_phone     text
-   - items              text   (JSON string of cart items)
-   - total_amount       numeric, not null
-   - discount           numeric, default 0
-   - paid_amount        numeric, not null
-   - due_amount         numeric, default 0
+   - items              text, not null   JSON string: list of {medicine_id, name, medicine_type, qty, unit_price, subtotal}
+   - subtotal           numeric, not null, default 0     sum of all line items before discount
+   - discount           numeric, not null, default 0
+   - total_amount       numeric, not null, default 0     subtotal - discount (the payable amount)
+   - payment_mode       text            'Cash' or 'Credit'
+   - paid_amount        numeric, not null, default 0
+   - due_amount         numeric, not null, default 0
    - created_at         timestamptz, default now()
 
-3) customer_ledger
+6) customer_ledger     (running credit balance a customer owes the pharmacy)
    - id                bigint, primary key, identity
    - customer_name      text, not null
    - customer_phone     text, not null, unique
@@ -40,11 +72,15 @@ SUPABASE TABLE SCHEMA (create these tables in your Supabase project before runni
 STREAMLIT SECRETS (.streamlit/secrets.toml):
    SUPABASE_URL = "https://xxxxxxxxxxxx.supabase.co"
    SUPABASE_KEY = "your-supabase-anon-or-service-key"
+
+PYTHON DEPENDENCIES:
+   pip install streamlit supabase pandas
 =================================================================================
 """
 
 import json
-from datetime import date, datetime, timedelta
+import random
+from datetime import date, datetime
 
 import pandas as pd
 import streamlit as st
@@ -55,67 +91,111 @@ from supabase import create_client, Client
 # PAGE CONFIG - MUST BE FIRST STREAMLIT COMMAND
 # =================================================================================
 st.set_page_config(
-    page_title="Med Life Pharmacy",
+    page_title="Med Life Pharmacy | ERP",
     page_icon="💊",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 # =================================================================================
-# MOBILE-FRIENDLY CSS
+# CUSTOM CSS - CORPORATE / ERP STYLE
 # =================================================================================
 st.markdown(
     """
     <style>
-        /* Bigger, touch friendly buttons */
-        div.stButton > button, div.stFormSubmitButton > button {
-            height: 3em;
-            font-size: 1.05rem;
-            font-weight: 600;
-            border-radius: 10px;
+        .stApp { background-color: #f4f6f8; }
+
+        .erp-header {
+            background: linear-gradient(90deg, #0b3d33 0%, #0f766e 60%, #14b8a6 100%);
+            padding: 20px 28px;
+            border-radius: 14px;
+            color: white;
+            margin-bottom: 1.4rem;
+            box-shadow: 0 4px 14px rgba(15, 118, 110, 0.25);
         }
-        /* Reduce top padding for more usable space on small screens */
-        .block-container {
-            padding-top: 1.2rem;
-            padding-bottom: 3rem;
-        }
-        /* Readable metric labels */
-        div[data-testid="stMetricValue"] {
-            font-size: 1.5rem;
-        }
-        /* Header banner */
-        .pharmacy-header {
-            background: linear-gradient(90deg, #0f766e, #14b8a6);
-            padding: 14px 18px;
+        .erp-header h1 { margin: 0; font-size: 1.7rem; font-weight: 700; color: white; letter-spacing: 0.3px; }
+        .erp-header p { margin: 4px 0 0 0; font-size: 0.9rem; opacity: 0.9; }
+
+        section[data-testid="stSidebar"] { background-color: #0b3d33; }
+        section[data-testid="stSidebar"] * { color: #eafaf5 !important; }
+        section[data-testid="stSidebar"] .stRadio label { font-size: 1.0rem; }
+
+        div[data-testid="stForm"] {
+            background-color: white;
+            padding: 20px;
             border-radius: 12px;
-            color: white;
-            margin-bottom: 1rem;
+            border: 1px solid #e2e8f0;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.05);
         }
-        .pharmacy-header h1 {
-            margin: 0;
-            font-size: 1.5rem;
-            color: white;
+
+        div.stButton > button, div.stFormSubmitButton > button {
+            border-radius: 8px;
+            font-weight: 600;
+            height: 2.8em;
         }
-        .pharmacy-header p {
-            margin: 0;
-            font-size: 0.9rem;
-            opacity: 0.9;
+
+        div[data-testid="stMetric"] {
+            background-color: white;
+            padding: 14px;
+            border-radius: 10px;
+            border: 1px solid #e2e8f0;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
         }
-        /* Make tabs bigger for touch */
-        button[data-baseweb="tab"] {
-            font-size: 1rem;
-            padding: 10px 14px;
+
+        h2, h3 { color: #0b3d33; }
+
+        .badge-cash {
+            background-color: #dcfce7; color: #166534; padding: 3px 10px;
+            border-radius: 20px; font-size: 0.8rem; font-weight: 700;
         }
-        @media (max-width: 640px) {
-            div[data-testid="stMetricValue"] { font-size: 1.15rem; }
-            .pharmacy-header h1 { font-size: 1.2rem; }
+        .badge-credit {
+            background-color: #fef3c7; color: #92400e; padding: 3px 10px;
+            border-radius: 20px; font-size: 0.8rem; font-weight: 700;
         }
+
+        /* Supershop-style voucher/receipt */
+        .voucher-box {
+            background-color: white;
+            border: 1.5px dashed #0f766e;
+            border-radius: 10px;
+            padding: 18px 20px;
+            font-family: 'Courier New', monospace;
+            color: #111827;
+            margin-top: 0.6rem;
+        }
+        .voucher-box h3 {
+            text-align: center;
+            margin: 0 0 2px 0;
+            color: #0b3d33;
+        }
+        .voucher-box .v-sub {
+            text-align: center;
+            font-size: 0.8rem;
+            color: #444;
+            margin-bottom: 10px;
+        }
+        .voucher-box hr {
+            border: none;
+            border-top: 1px dashed #999;
+            margin: 8px 0;
+        }
+        .voucher-box table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+        .voucher-box th { text-align: left; border-bottom: 1px solid #999; padding: 4px 2px; }
+        .voucher-box td { padding: 4px 2px; }
+        .voucher-box .v-right { text-align: right; }
+        .voucher-box .v-total-row td { font-weight: 700; font-size: 1.0rem; border-top: 1px dashed #999; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-CURRENCY = "৳"
+NEW_CUSTOM_LABEL = "-- New / Custom Medicine --"
+NEW_SUPPLIER_LABEL = "-- New / Custom Supplier --"
+
+MEDICINE_TYPES = [
+    "Tablet", "Capsule", "Syrup", "Suspension", "Injection", "Syringe",
+    "Drops", "Ointment/Cream", "Inhaler", "Powder/Sachet", "IV Fluid/Saline", "Other",
+]
 
 
 # =================================================================================
@@ -131,36 +211,75 @@ def init_connection() -> Client:
 try:
     supabase: Client = init_connection()
 except Exception as e:
-    st.error(f"❌ Could not connect to Supabase. Check your secrets.toml. Details: {e}")
+    st.error(f"❌ Could not connect to Supabase. Please check your secrets.toml configuration. Details: {e}")
     st.stop()
 
 
 # =================================================================================
-# DATA ACCESS HELPERS (all wrapped in try/except)
+# DATA ACCESS HELPERS (every Supabase call wrapped in try/except)
 # =================================================================================
-@st.cache_data(ttl=15, show_spinner=False)
+@st.cache_data(ttl=20, show_spinner=False)
+def fetch_master_medicines() -> pd.DataFrame:
+    try:
+        res = supabase.table("master_medicines").select("*").order("brand_name").execute()
+        return pd.DataFrame(res.data)
+    except Exception as e:
+        st.error(f"❌ Failed to fetch master medicine catalogue: {e}")
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=20, show_spinner=False)
 def fetch_medicines() -> pd.DataFrame:
     try:
         res = supabase.table("medicines").select("*").order("name").execute()
         df = pd.DataFrame(res.data)
         if not df.empty:
-            df["expiry_date"] = pd.to_datetime(df["expiry_date"], errors="coerce")
-            for col in ["purchase_price", "selling_price", "stock_quantity"]:
+            df["stock"] = pd.to_numeric(df["stock"], errors="coerce").fillna(0).astype(int)
+            if "medicine_type" not in df.columns:
+                df["medicine_type"] = ""
+            df["medicine_type"] = df["medicine_type"].fillna("")
+        return df
+    except Exception as e:
+        st.error(f"❌ Failed to fetch inventory: {e}")
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def fetch_purchases() -> pd.DataFrame:
+    try:
+        res = supabase.table("purchases").select("*").order("purchase_date", desc=True).execute()
+        df = pd.DataFrame(res.data)
+        if not df.empty:
+            df["purchase_date"] = pd.to_datetime(df["purchase_date"], errors="coerce")
+            for col in ["quantity", "total_amount", "paid_amount", "due_amount"]:
                 df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
         return df
     except Exception as e:
-        st.error(f"❌ Failed to fetch medicines: {e}")
+        st.error(f"❌ Failed to fetch purchase history: {e}")
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def fetch_supplier_ledger() -> pd.DataFrame:
+    try:
+        res = supabase.table("supplier_ledger").select("*").order("total_due", desc=True).execute()
+        df = pd.DataFrame(res.data)
+        if not df.empty:
+            df["total_due"] = pd.to_numeric(df["total_due"], errors="coerce").fillna(0)
+        return df
+    except Exception as e:
+        st.error(f"❌ Failed to fetch supplier ledger: {e}")
         return pd.DataFrame()
 
 
 @st.cache_data(ttl=15, show_spinner=False)
 def fetch_sales() -> pd.DataFrame:
     try:
-        res = supabase.table("sales").select("*").order("sale_date", desc=True).execute()
+        res = supabase.table("sales").select("*").order("created_at", desc=True).execute()
         df = pd.DataFrame(res.data)
         if not df.empty:
             df["sale_date"] = pd.to_datetime(df["sale_date"], errors="coerce")
-            for col in ["total_amount", "discount", "paid_amount", "due_amount"]:
+            for col in ["subtotal", "discount", "total_amount", "paid_amount", "due_amount"]:
                 df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
         return df
     except Exception as e:
@@ -169,7 +288,7 @@ def fetch_sales() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=15, show_spinner=False)
-def fetch_customers() -> pd.DataFrame:
+def fetch_customer_ledger() -> pd.DataFrame:
     try:
         res = supabase.table("customer_ledger").select("*").order("total_due", desc=True).execute()
         df = pd.DataFrame(res.data)
@@ -182,49 +301,124 @@ def fetch_customers() -> pd.DataFrame:
 
 
 def clear_all_caches():
+    fetch_master_medicines.clear()
     fetch_medicines.clear()
+    fetch_purchases.clear()
+    fetch_supplier_ledger.clear()
     fetch_sales.clear()
-    fetch_customers.clear()
+    fetch_customer_ledger.clear()
 
 
-def insert_medicine(payload: dict) -> bool:
+def find_medicine_by_name(name: str):
     try:
-        supabase.table("medicines").insert(payload).execute()
+        res = supabase.table("medicines").select("*").eq("name", name).execute()
+        return res.data[0] if res.data else None
+    except Exception as e:
+        st.error(f"❌ Failed to look up medicine: {e}")
+        return None
+
+
+def insert_medicine(name: str, stock: int, medicine_type: str) -> bool:
+    try:
+        supabase.table("medicines").insert(
+            {"name": name, "stock": stock, "medicine_type": medicine_type}
+        ).execute()
         return True
     except Exception as e:
-        st.error(f"❌ Failed to add medicine: {e}")
+        st.error(f"❌ Failed to save new medicine: {e}")
         return False
 
 
-def update_medicine(med_id, payload: dict) -> bool:
+def update_medicine_stock(med_id, new_stock: int, medicine_type: str = None) -> bool:
     try:
+        payload = {"stock": new_stock}
+        if medicine_type:
+            payload["medicine_type"] = medicine_type
         supabase.table("medicines").update(payload).eq("id", med_id).execute()
         return True
     except Exception as e:
-        st.error(f"❌ Failed to update medicine: {e}")
+        st.error(f"❌ Failed to update stock: {e}")
         return False
 
 
-def delete_medicine(med_id) -> bool:
+def save_or_restock(name: str, added_qty: int, medicine_type: str) -> tuple:
+    """If a medicine with this exact name already exists, add to its stock (restock) and
+    refresh its type. Otherwise insert a brand new row. Returns (success, message)."""
+    name = name.strip()
+    if not name:
+        return False, "Medicine name cannot be empty."
+
+    existing = find_medicine_by_name(name)
+    if existing:
+        new_stock = int(existing["stock"]) + added_qty
+        ok = update_medicine_stock(existing["id"], new_stock, medicine_type)
+        if ok:
+            return True, f"'{name}' already existed — stock increased to {new_stock} pcs."
+        return False, "Failed to update existing medicine stock."
+    else:
+        ok = insert_medicine(name, added_qty, medicine_type)
+        if ok:
+            return True, f"'{name}' added as a new item with {added_qty} pcs in stock."
+        return False, "Failed to save the new medicine."
+
+
+def insert_purchase(payload: dict) -> bool:
     try:
-        supabase.table("medicines").delete().eq("id", med_id).execute()
+        supabase.table("purchases").insert(payload).execute()
         return True
     except Exception as e:
-        st.error(f"❌ Failed to delete medicine: {e}")
+        st.error(f"❌ Failed to record purchase transaction: {e}")
         return False
 
 
-def insert_sale(payload: dict) -> bool:
+def upsert_supplier_due(supplier_name: str, delta_due: float) -> bool:
+    """Add delta_due to an existing supplier's total_due, or create a new ledger record."""
     try:
-        supabase.table("sales").insert(payload).execute()
+        existing = supabase.table("supplier_ledger").select("*").eq("supplier_name", supplier_name).execute()
+        if existing.data:
+            current_due = float(existing.data[0]["total_due"] or 0)
+            new_due = current_due + delta_due
+            supabase.table("supplier_ledger").update(
+                {"total_due": new_due, "updated_at": datetime.now().isoformat()}
+            ).eq("supplier_name", supplier_name).execute()
+        else:
+            supabase.table("supplier_ledger").insert(
+                {"supplier_name": supplier_name, "total_due": delta_due, "updated_at": datetime.now().isoformat()}
+            ).execute()
         return True
+    except Exception as e:
+        st.error(f"❌ Failed to update supplier due: {e}")
+        return False
+
+
+def pay_supplier(supplier_id, new_due: float) -> bool:
+    try:
+        supabase.table("supplier_ledger").update(
+            {"total_due": new_due, "updated_at": datetime.now().isoformat()}
+        ).eq("id", supplier_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"❌ Failed to record supplier payment: {e}")
+        return False
+
+
+def generate_voucher_no() -> str:
+    """Unique, human-readable voucher/invoice number, e.g. MLP-20260917-143205-482."""
+    return f"MLP-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{random.randint(100, 999)}"
+
+
+def insert_sale(payload: dict):
+    """Insert a sale (invoice) row. Returns the inserted row (dict) on success, else None."""
+    try:
+        res = supabase.table("sales").insert(payload).execute()
+        return res.data[0] if res.data else payload
     except Exception as e:
         st.error(f"❌ Failed to record sale: {e}")
-        return False
+        return None
 
 
 def upsert_customer_due(name: str, phone: str, delta_due: float) -> bool:
-    """Add delta_due to an existing customer's total_due, or create a new record."""
+    """Add delta_due to an existing customer's total_due, or create a new ledger record."""
     try:
         existing = supabase.table("customer_ledger").select("*").eq("customer_phone", phone).execute()
         if existing.data:
@@ -248,22 +442,76 @@ def upsert_customer_due(name: str, phone: str, delta_due: float) -> bool:
         return False
 
 
-def receive_payment(customer_id, new_due: float) -> bool:
+def receive_customer_payment(customer_id, new_due: float) -> bool:
     try:
         supabase.table("customer_ledger").update(
             {"total_due": new_due, "updated_at": datetime.now().isoformat()}
         ).eq("id", customer_id).execute()
         return True
     except Exception as e:
-        st.error(f"❌ Failed to record payment: {e}")
+        st.error(f"❌ Failed to record customer payment: {e}")
         return False
 
 
 def fmt_money(val) -> str:
     try:
-        return f"{CURRENCY}{float(val):,.2f}"
+        return f"৳{float(val):,.2f}"
     except Exception:
-        return f"{CURRENCY}0.00"
+        return "৳0.00"
+
+
+def render_voucher_html(sale_row: dict) -> str:
+    """Build the supershop-style printable voucher HTML for a completed sale."""
+    try:
+        items = json.loads(sale_row.get("items") or "[]")
+    except Exception:
+        items = []
+
+    sale_date = sale_row.get("sale_date", "")
+    if hasattr(sale_date, "strftime"):
+        sale_date = sale_date.strftime("%Y-%m-%d")
+
+    rows_html = ""
+    for it in items:
+        rows_html += (
+            f"<tr><td>{it.get('name', '')}"
+            f"{' (' + it.get('medicine_type') + ')' if it.get('medicine_type') else ''}</td>"
+            f"<td class='v-right'>{it.get('qty', 0)}</td>"
+            f"<td class='v-right'>{fmt_money(it.get('unit_price', 0))}</td>"
+            f"<td class='v-right'>{fmt_money(it.get('subtotal', 0))}</td></tr>"
+        )
+
+    payment_mode = sale_row.get("payment_mode", "")
+    badge_class = "badge-cash" if payment_mode == "Cash" else "badge-credit"
+
+    html = f"""
+    <div class="voucher-box">
+        <h3>💊 Med Life Pharmacy</h3>
+        <div class="v-sub">Chachkoir, Khalifa Para, Gurudaspur, Natore</div>
+        <hr>
+        <div><b>Voucher No:</b> {sale_row.get('voucher_no', '')}</div>
+        <div><b>Date:</b> {sale_date}</div>
+        <div><b>Customer:</b> {sale_row.get('customer_name') or 'Walk-in Customer'}
+             {('· ' + sale_row.get('customer_phone')) if sale_row.get('customer_phone') else ''}</div>
+        <hr>
+        <table>
+            <tr><th>Item</th><th class="v-right">Qty</th><th class="v-right">Price</th><th class="v-right">Amount</th></tr>
+            {rows_html}
+        </table>
+        <hr>
+        <table>
+            <tr><td>Subtotal</td><td class="v-right">{fmt_money(sale_row.get('subtotal', 0))}</td></tr>
+            <tr><td>Discount</td><td class="v-right">- {fmt_money(sale_row.get('discount', 0))}</td></tr>
+            <tr class="v-total-row"><td>Total Payable</td><td class="v-right">{fmt_money(sale_row.get('total_amount', 0))}</td></tr>
+            <tr><td>Paid Amount</td><td class="v-right">{fmt_money(sale_row.get('paid_amount', 0))}</td></tr>
+            <tr><td>Due Amount</td><td class="v-right">{fmt_money(sale_row.get('due_amount', 0))}</td></tr>
+        </table>
+        <hr>
+        <div>Payment Mode: <span class="{badge_class}">{payment_mode}</span></div>
+        <div class="v-sub" style="margin-top:10px;">Thank you for shopping with us!</div>
+    </div>
+    """
+    return html
 
 
 # =================================================================================
@@ -271,462 +519,666 @@ def fmt_money(val) -> str:
 # =================================================================================
 st.markdown(
     """
-    <div class="pharmacy-header">
+    <div class="erp-header">
         <h1>💊 Med Life Pharmacy</h1>
-        <p>📍 Chachkoir, Khalifa Para, Gurudaspur, Natore</p>
+        <p>ERP System — Purchase, Multi-Product Sales, Inventory &amp; Ledger Management</p>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
 # =================================================================================
-# SESSION STATE INIT
-# =================================================================================
-if "cart" not in st.session_state:
-    st.session_state.cart = []  # list of dicts: id, name, price, qty, subtotal
-
-# =================================================================================
 # SIDEBAR NAVIGATION
 # =================================================================================
-st.sidebar.title("📋 Menu")
+st.sidebar.markdown("## 📋 ERP Modules")
 page = st.sidebar.radio(
     "Navigate",
     [
-        "📊 Dashboard (ড্যাশবোর্ড)",
-        "💊 Inventory & Purchase (ইনভেন্টরি ও প্রোডাক্ট এন্ট্রি)",
-        "🛒 POS / Billing (বিক্রি ও বিল)",
-        "📗 Customer Due Ledger (বাকির হিসাব)",
-        "📈 Sales History (বিক্রির রিপোর্ট)",
+        "➕ Purchase / Stock Entry",
+        "🛒 Sales Module",
+        "📦 Inventory Reports",
+        "🧾 Supplier Ledger (Credit Due)",
+        "📗 Customer Ledger (Credit Due)",
+        "🧾 Sales History / Vouchers",
+        "⚙️ Settings",
     ],
     label_visibility="collapsed",
 )
 
+st.sidebar.markdown("---")
 if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
     clear_all_caches()
     st.rerun()
 
+st.sidebar.markdown("---")
+st.sidebar.caption(f"🕒 {datetime.now().strftime('%d %b %Y, %I:%M %p')}")
+
 
 # =================================================================================
-# PAGE 1: DASHBOARD
+# MODULE 1: PURCHASE / STOCK ENTRY
 # =================================================================================
-def render_dashboard():
-    st.subheader("📊 Dashboard")
+def render_purchase():
+    st.subheader("➕ Purchase / Stock Entry")
+    st.caption("Record incoming stock along with medicine type, supplier and payment details (Cash or Credit).")
 
-    meds_df = fetch_medicines()
-    sales_df = fetch_sales()
-    cust_df = fetch_customers()
+    master_df = fetch_master_medicines()
+    purchases_df = fetch_purchases()
 
-    total_medicines = 0 if meds_df.empty else meds_df.shape[0]
-    total_due = 0.0 if cust_df.empty else float(cust_df["total_due"].sum())
+    # ---------- Build medicine auto-suggest options ----------
+    option_map = {}
+    display_options = [NEW_CUSTOM_LABEL]
+    form_hint_map = {}
 
-    today = date.today()
-    if not sales_df.empty:
-        today_sales_df = sales_df[sales_df["sale_date"].dt.date == today]
-        today_sales = float(today_sales_df["total_amount"].sum()) if not today_sales_df.empty else 0.0
+    if not master_df.empty:
+        for _, row in master_df.iterrows():
+            brand = str(row.get("brand_name") or "").strip()
+            company = str(row.get("company_name") or "").strip()
+            form = str(row.get("form") or "").strip()
+            if not brand:
+                continue
+            label = f"{brand} ({form}) - {company}" if form or company else brand
+            option_map[label] = brand
+            form_hint_map[label] = form
+            display_options.append(label)
     else:
-        today_sales = 0.0
+        st.info("ℹ️ No items found in the master medicine catalogue yet. You can still add a custom medicine below.")
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("💊 Total Active Medicines", f"{total_medicines}")
-    c2.metric("📗 Total Dues Receivable", fmt_money(total_due))
-    c3.metric("🛒 Today's Total Sales", fmt_money(today_sales))
+    # ---------- Build supplier auto-suggest options ----------
+    supplier_options = [NEW_SUPPLIER_LABEL]
+    if not purchases_df.empty and "supplier_name" in purchases_df.columns:
+        known_suppliers = sorted(purchases_df["supplier_name"].dropna().unique().tolist())
+        supplier_options += known_suppliers
 
-    st.markdown("---")
+    # A version counter is used as a key-suffix so that after a successful save we can
+    # reset every input back to its default (st.form's clear_on_submit can't be used here
+    # because we need fields to react live — e.g. Box vs Pcs — before the user submits).
+    if "purchase_form_version" not in st.session_state:
+        st.session_state.purchase_form_version = 0
+    v = st.session_state.purchase_form_version
 
-    col_a, col_b = st.columns(2)
-
-    with col_a:
-        st.markdown("##### ⚠️ Low Stock Alert (Qty < 10)")
-        if not meds_df.empty:
-            low_stock = meds_df[meds_df["stock_quantity"] < 10][
-                ["name", "generic_name", "stock_quantity", "shelf_no"]
-            ].sort_values("stock_quantity")
-            if not low_stock.empty:
-                st.dataframe(low_stock, use_container_width=True, hide_index=True)
-            else:
-                st.success("✅ No low stock items.")
-        else:
-            st.info("No medicine data available yet.")
-
-    with col_b:
-        st.markdown("##### ⏳ Expiring Soon (within 30 days)")
-        if not meds_df.empty:
-            cutoff = pd.Timestamp(today + timedelta(days=30))
-            expiring = meds_df[
-                (meds_df["expiry_date"].notna()) & (meds_df["expiry_date"] <= cutoff)
-            ][["name", "generic_name", "expiry_date", "stock_quantity"]].sort_values("expiry_date")
-            if not expiring.empty:
-                expiring = expiring.copy()
-                expiring["expiry_date"] = expiring["expiry_date"].dt.strftime("%Y-%m-%d")
-                st.dataframe(expiring, use_container_width=True, hide_index=True)
-            else:
-                st.success("✅ No medicines expiring soon.")
-        else:
-            st.info("No medicine data available yet.")
-
-
-# =================================================================================
-# PAGE 2: INVENTORY & PURCHASE
-# =================================================================================
-def render_inventory():
-    st.subheader("💊 Inventory & Purchase Management")
-
-    tab1, tab2, tab3 = st.tabs(
-        ["➕ Add New Product", "📦 Restock Existing", "📋 Stock View & Search"]
-    )
-
-    # ---------------- TAB 1: ADD NEW PRODUCT ----------------
-    with tab1:
-        st.markdown("##### নতুন ওষুধ এন্ট্রি")
-        with st.form("add_new_product_form", clear_on_submit=True):
-            name = st.text_input("Medicine Name *")
-            generic_name = st.text_input("Generic Name")
-            shelf_no = st.text_input("Shelf / Rack No")
-
-            col1, col2 = st.columns(2)
-            with col1:
-                purchase_price = st.number_input("Purchase Price (ক্রয়মূল্য) *", min_value=0.0, step=0.5)
-                purchased_qty = st.number_input("Purchased Quantity *", min_value=0.0, step=1.0)
-            with col2:
-                selling_price = st.number_input("Selling Price (বিক্রয়মূল্য) *", min_value=0.0, step=0.5)
-                expiry_date_val = st.date_input("Expiry Date *", value=date.today() + timedelta(days=180))
-
-            submitted = st.form_submit_button("💾 Save Product", use_container_width=True, type="primary")
-
-            if submitted:
-                if not name.strip():
-                    st.error("⚠️ Medicine Name is required.")
-                elif purchased_qty <= 0:
-                    st.error("⚠️ Purchased Quantity must be greater than 0.")
-                else:
-                    payload = {
-                        "name": name.strip(),
-                        "generic_name": generic_name.strip(),
-                        "shelf_no": shelf_no.strip(),
-                        "purchase_price": purchase_price,
-                        "selling_price": selling_price,
-                        "stock_quantity": purchased_qty,
-                        "expiry_date": expiry_date_val.isoformat(),
-                    }
-                    if insert_medicine(payload):
-                        clear_all_caches()
-                        st.success(f"✅ '{name}' added to inventory successfully!")
-                        st.rerun()
-
-    # ---------------- TAB 2: RESTOCK EXISTING ----------------
-    with tab2:
-        st.markdown("##### বিদ্যমান ওষুধের স্টক বাড়ানো")
-        meds_df = fetch_medicines()
-
-        if meds_df.empty:
-            st.info("No medicines found. Please add a product first.")
-        else:
-            meds_df = meds_df.sort_values("name")
-            options = meds_df.apply(
-                lambda r: f"{r['name']} (Stock: {int(r['stock_quantity'])})  [ID:{r['id']}]", axis=1
-            ).tolist()
-            selected_option = st.selectbox("Select Medicine to Restock *", options)
-
-            selected_id = int(selected_option.split("[ID:")[1].replace("]", ""))
-            selected_row = meds_df[meds_df["id"] == selected_id].iloc[0]
-
-            info_col1, info_col2, info_col3 = st.columns(3)
-            info_col1.metric("Current Stock", f"{int(selected_row['stock_quantity'])}")
-            info_col2.metric("Current Purchase Price", fmt_money(selected_row["purchase_price"]))
-            info_col3.metric("Current Selling Price", fmt_money(selected_row["selling_price"]))
-
-            with st.form("restock_form", clear_on_submit=True):
-                additional_qty = st.number_input("Additional Quantity Purchased *", min_value=0.0, step=1.0)
-
-                col1, col2 = st.columns(2)
-                with col1:
-                    updated_purchase_price = st.number_input(
-                        "Updated Purchase Price", min_value=0.0, value=float(selected_row["purchase_price"]), step=0.5
-                    )
-                with col2:
-                    updated_selling_price = st.number_input(
-                        "Updated Selling Price", min_value=0.0, value=float(selected_row["selling_price"]), step=0.5
-                    )
-
-                update_expiry = st.checkbox("Update Expiry Date?")
-                new_expiry = None
-                if update_expiry:
-                    default_expiry = (
-                        selected_row["expiry_date"].date()
-                        if pd.notna(selected_row["expiry_date"])
-                        else date.today()
-                    )
-                    new_expiry = st.date_input("New Expiry Date", value=default_expiry)
-
-                restock_submit = st.form_submit_button("📦 Update Stock", use_container_width=True, type="primary")
-
-                if restock_submit:
-                    if additional_qty <= 0:
-                        st.error("⚠️ Additional Quantity must be greater than 0.")
-                    else:
-                        new_stock = float(selected_row["stock_quantity"]) + additional_qty
-                        payload = {
-                            "stock_quantity": new_stock,
-                            "purchase_price": updated_purchase_price,
-                            "selling_price": updated_selling_price,
-                        }
-                        if update_expiry and new_expiry:
-                            payload["expiry_date"] = new_expiry.isoformat()
-
-                        if update_medicine(selected_id, payload):
-                            clear_all_caches()
-                            st.success(f"✅ Stock updated! New quantity: {int(new_stock)}")
-                            st.rerun()
-
-    # ---------------- TAB 3: STOCK VIEW & SEARCH ----------------
-    with tab3:
-        st.markdown("##### ইনভেন্টরি দেখা ও সংশোধন")
-        meds_df = fetch_medicines()
-
-        if meds_df.empty:
-            st.info("No medicines in inventory yet.")
-        else:
-            search_term = st.text_input("🔍 Search by Medicine Name or Generic Name")
-            display_df = meds_df.copy()
-            if search_term:
-                mask = display_df["name"].str.contains(search_term, case=False, na=False) | display_df[
-                    "generic_name"
-                ].str.contains(search_term, case=False, na=False)
-                display_df = display_df[mask]
-
-            show_df = display_df.copy()
-            show_df["expiry_date"] = show_df["expiry_date"].dt.strftime("%Y-%m-%d")
-            st.dataframe(
-                show_df[
-                    ["id", "name", "generic_name", "shelf_no", "purchase_price", "selling_price",
-                     "stock_quantity", "expiry_date"]
-                ],
-                use_container_width=True,
-                hide_index=True,
+    st.markdown("##### 💊 Medicine Details")
+    col1, col2 = st.columns(2)
+    with col1:
+        selected_label = st.selectbox("Select Medicine", display_options, key=f"pur_med_{v}")
+        custom_name = ""
+        if selected_label == NEW_CUSTOM_LABEL:
+            custom_name = st.text_input(
+                "Enter Medicine Name *", placeholder="e.g. Napa Extra 500mg", key=f"pur_custom_name_{v}"
             )
 
-            st.markdown("---")
-            st.markdown("##### ✏️ Edit / 🗑️ Delete a Medicine")
+    with col2:
+        default_type_idx = 0
+        hint = form_hint_map.get(selected_label, "")
+        for i, t in enumerate(MEDICINE_TYPES):
+            if hint and t.lower().startswith(hint.lower()[:4]):
+                default_type_idx = i
+                break
+        medicine_type = st.selectbox(
+            "Medicine Type *", MEDICINE_TYPES, index=default_type_idx, key=f"pur_type_{v}"
+        )
+        custom_type = ""
+        if medicine_type == "Other":
+            custom_type = st.text_input(
+                "Specify Medicine Type *", placeholder="e.g. Nebulizer Solution", key=f"pur_custom_type_{v}"
+            )
 
-            if not display_df.empty:
-                edit_options = display_df.apply(lambda r: f"{r['name']}  [ID:{r['id']}]", axis=1).tolist()
-                edit_selected = st.selectbox("Select Medicine to Edit or Delete", edit_options, key="edit_select")
-                edit_id = int(edit_selected.split("[ID:")[1].replace("]", ""))
-                edit_row = display_df[display_df["id"] == edit_id].iloc[0]
+    st.markdown("---")
+    st.markdown("##### 📦 Purchase Unit & Quantity")
+    st.caption("Medicines are usually purchased by Box/Carton but sold individually in Pcs — the app converts automatically.")
 
-                with st.form("edit_medicine_form"):
-                    e_name = st.text_input("Medicine Name", value=edit_row["name"])
-                    e_generic = st.text_input("Generic Name", value=edit_row["generic_name"] or "")
-                    e_shelf = st.text_input("Shelf / Rack No", value=edit_row["shelf_no"] or "")
+    purchase_unit = st.radio(
+        "How was this purchased? *", ["Box / Carton", "Pcs (Loose Units)"], horizontal=True, key=f"pur_unit_{v}"
+    )
 
-                    ecol1, ecol2 = st.columns(2)
-                    with ecol1:
-                        e_purchase = st.number_input(
-                            "Purchase Price", min_value=0.0, value=float(edit_row["purchase_price"]), step=0.5
-                        )
-                        e_qty = st.number_input(
-                            "Stock Quantity", min_value=0.0, value=float(edit_row["stock_quantity"]), step=1.0
-                        )
-                    with ecol2:
-                        e_selling = st.number_input(
-                            "Selling Price", min_value=0.0, value=float(edit_row["selling_price"]), step=0.5
-                        )
-                        e_expiry_default = (
-                            edit_row["expiry_date"].date() if pd.notna(edit_row["expiry_date"]) else date.today()
-                        )
-                        e_expiry = st.date_input("Expiry Date", value=e_expiry_default)
+    box_quantity = None
+    units_per_box = None
 
-                    ecol_btn1, ecol_btn2 = st.columns(2)
-                    with ecol_btn1:
-                        update_btn = st.form_submit_button("💾 Update", use_container_width=True, type="primary")
-                    with ecol_btn2:
-                        delete_btn = st.form_submit_button("🗑️ Delete", use_container_width=True)
+    if purchase_unit == "Box / Carton":
+        colb1, colb2 = st.columns(2)
+        with colb1:
+            box_quantity = st.number_input("Number of Boxes *", min_value=1, value=1, step=1, key=f"pur_boxes_{v}")
+        with colb2:
+            units_per_box = st.number_input("Pcs per Box *", min_value=1, value=10, step=1, key=f"pur_ppb_{v}")
+        total_pcs = int(box_quantity) * int(units_per_box)
+        st.info(f"📦 {int(box_quantity)} Box × {int(units_per_box)} pcs/box = **{total_pcs} pcs** will be added to stock")
+    else:
+        total_pcs = st.number_input(
+            "Total Quantity in Pcs *", min_value=1, value=10, step=1, key=f"pur_pcs_{v}"
+        )
+        total_pcs = int(total_pcs)
 
-                    if update_btn:
-                        payload = {
-                            "name": e_name.strip(),
-                            "generic_name": e_generic.strip(),
-                            "shelf_no": e_shelf.strip(),
-                            "purchase_price": e_purchase,
-                            "selling_price": e_selling,
-                            "stock_quantity": e_qty,
-                            "expiry_date": e_expiry.isoformat(),
+    st.markdown("---")
+    st.markdown("##### 🏭 Supplier & Payment Details")
+    col3, col4 = st.columns(2)
+    with col3:
+        selected_supplier_label = st.selectbox(
+            "Purchased From (Supplier / Company) *", supplier_options, key=f"pur_supp_{v}"
+        )
+        custom_supplier = ""
+        if selected_supplier_label == NEW_SUPPLIER_LABEL:
+            custom_supplier = st.text_input(
+                "Enter Supplier / Company Name *", placeholder="e.g. Square Pharmaceuticals", key=f"pur_custom_supp_{v}"
+            )
+    with col4:
+        payment_type = st.radio("Payment Type *", ["Cash", "Credit"], horizontal=True, key=f"pur_pay_{v}")
+
+    total_amount = st.number_input(
+        "Total Purchase Amount (TK) *", min_value=0.0, value=0.0, step=1.0, key=f"pur_total_{v}"
+    )
+
+    paid_amount = total_amount
+    if payment_type == "Credit":
+        paid_amount = st.number_input(
+            "Amount Paid Now (TK)", min_value=0.0, max_value=float(total_amount), value=0.0, step=1.0,
+            key=f"pur_paid_{v}",
+        )
+
+    due_amount = max(total_amount - paid_amount, 0.0)
+    if payment_type == "Credit":
+        st.info(f"📌 Outstanding Credit for this purchase: **{fmt_money(due_amount)}**")
+
+    st.markdown("---")
+    submitted = st.button(
+        "💾 Save Purchase & Update Stock", use_container_width=True, type="primary", key=f"pur_submit_{v}"
+    )
+
+    if submitted:
+        # Resolve medicine name
+        if selected_label == NEW_CUSTOM_LABEL:
+            final_name = custom_name.strip()
+        else:
+            final_name = option_map.get(selected_label, selected_label)
+
+        # Resolve medicine type
+        final_type = custom_type.strip() if medicine_type == "Other" else medicine_type
+
+        # Resolve supplier
+        if selected_supplier_label == NEW_SUPPLIER_LABEL:
+            final_supplier = custom_supplier.strip()
+        else:
+            final_supplier = selected_supplier_label
+
+        # ---------- Validation ----------
+        errors = []
+        if not final_name:
+            errors.append("Medicine name is required.")
+        if medicine_type == "Other" and not final_type:
+            errors.append("Please specify the custom medicine type.")
+        if not final_supplier:
+            errors.append("Supplier / company name is required.")
+        if total_pcs <= 0:
+            errors.append("Purchased quantity must be greater than 0.")
+        if total_amount <= 0:
+            errors.append("Total purchase amount must be greater than 0.")
+        if payment_type == "Credit" and paid_amount > total_amount:
+            errors.append("Paid amount cannot exceed the total purchase amount.")
+
+        if errors:
+            for err in errors:
+                st.error(f"⚠️ {err}")
+            st.stop()
+
+        # ---------- Save ----------
+        stock_ok, stock_msg = save_or_restock(final_name, total_pcs, final_type)
+
+        purchase_payload = {
+            "purchase_date": date.today().isoformat(),
+            "medicine_name": final_name,
+            "medicine_type": final_type,
+            "supplier_name": final_supplier,
+            "purchase_unit": "Box" if purchase_unit == "Box / Carton" else "Pcs",
+            "box_quantity": int(box_quantity) if box_quantity is not None else None,
+            "units_per_box": int(units_per_box) if units_per_box is not None else None,
+            "quantity": total_pcs,
+            "payment_type": payment_type,
+            "total_amount": total_amount,
+            "paid_amount": paid_amount if payment_type == "Credit" else total_amount,
+            "due_amount": due_amount if payment_type == "Credit" else 0.0,
+        }
+        purchase_ok = insert_purchase(purchase_payload)
+
+        ledger_ok = True
+        if payment_type == "Credit" and due_amount > 0:
+            ledger_ok = upsert_supplier_due(final_supplier, due_amount)
+
+        if stock_ok and purchase_ok and ledger_ok:
+            clear_all_caches()
+            st.success(f"✅ {stock_msg}")
+            st.success(
+                f"🧾 Purchase recorded — {payment_type} — {total_pcs} pcs — Total: {fmt_money(total_amount)}"
+                + (f" | Due: {fmt_money(due_amount)}" if payment_type == "Credit" and due_amount > 0 else "")
+            )
+            st.balloons()
+            # Reset all inputs back to their defaults for the next entry
+            st.session_state.purchase_form_version += 1
+            st.rerun()
+        else:
+            st.error("❌ Something went wrong while saving. Please check the errors above and try again.")
+
+    # ---------- Recent purchases preview ----------
+    st.markdown("---")
+    st.markdown("##### 🕘 Recent Purchases")
+    if purchases_df.empty:
+        st.info("No purchase records yet.")
+    else:
+        recent = purchases_df.head(10).copy()
+        recent["purchase_date"] = recent["purchase_date"].dt.strftime("%Y-%m-%d")
+
+        def describe_unit(row):
+            if row.get("purchase_unit") == "Box" and pd.notna(row.get("box_quantity")) and pd.notna(row.get("units_per_box")):
+                return f"{int(row['box_quantity'])} Box × {int(row['units_per_box'])}"
+            return "Loose Pcs"
+
+        recent["Purchased As"] = recent.apply(describe_unit, axis=1)
+        recent = recent.rename(
+            columns={
+                "purchase_date": "Date",
+                "medicine_name": "Medicine",
+                "medicine_type": "Type",
+                "supplier_name": "Supplier",
+                "quantity": "Total Pcs",
+                "payment_type": "Payment",
+                "total_amount": "Total (TK)",
+                "paid_amount": "Paid (TK)",
+                "due_amount": "Due (TK)",
+            }
+        )
+        st.dataframe(
+            recent[
+                ["Date", "Medicine", "Type", "Supplier", "Purchased As", "Total Pcs",
+                 "Payment", "Total (TK)", "Paid (TK)", "Due (TK)"]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+# =================================================================================
+# MODULE 2: SALES MODULE  (multi-product cart, voucher, discount, Cash/Credit)
+# =================================================================================
+def render_sales():
+    st.subheader("🛒 Sales Module")
+    st.caption("Add one or more products to the cart, then checkout to generate a voucher — just like a supershop bill.")
+
+    if "sale_cart" not in st.session_state:
+        st.session_state.sale_cart = []  # list of dicts: medicine_id, name, medicine_type, qty, unit_price, subtotal
+    if "last_voucher" not in st.session_state:
+        st.session_state.last_voucher = None
+
+    meds_df = fetch_medicines()
+    in_stock_df = meds_df[meds_df["stock"] > 0] if not meds_df.empty else pd.DataFrame()
+
+    if in_stock_df.empty:
+        st.warning("⚠️ No medicines currently in stock. Please add stock from the Purchase module first.")
+        return
+
+    # ---------- Add Product to Cart ----------
+    st.markdown("##### 🔎 Find & Add Product")
+    search_term = st.text_input(
+        "Type to search product name", placeholder="Start typing a medicine name...", label_visibility="collapsed"
+    )
+
+    filtered_df = in_stock_df.copy()
+    if search_term:
+        filtered_df = filtered_df[filtered_df["name"].str.contains(search_term, case=False, na=False)]
+
+    if filtered_df.empty:
+        st.warning("⚠️ No matching product found for that search term.")
+    else:
+        med_options = filtered_df.apply(
+            lambda r: f"{r['name']}"
+                      + (f"  ·  {r['medicine_type']}" if r.get("medicine_type") else "")
+                      + f"  ·  Available: {int(r['stock'])} pcs",
+            axis=1,
+        ).tolist()
+        id_lookup = dict(zip(med_options, filtered_df["id"]))
+
+        colp1, colp2, colp3, colp4 = st.columns([2.4, 0.9, 1.1, 0.8])
+        with colp1:
+            selected_option = st.selectbox("Product", med_options, label_visibility="collapsed")
+        selected_id = id_lookup[selected_option]
+        selected_row = filtered_df[filtered_df["id"] == selected_id].iloc[0]
+        available_stock = int(selected_row["stock"])
+
+        with colp2:
+            add_qty = st.number_input(
+                "Qty", min_value=1, max_value=available_stock, value=1, step=1, label_visibility="collapsed"
+            )
+        with colp3:
+            add_price = st.number_input(
+                "Price/unit", min_value=0.0, value=0.0, step=0.5, format="%.2f", label_visibility="collapsed"
+            )
+        with colp4:
+            add_clicked = st.button("➕ Add", use_container_width=True)
+
+        if add_clicked:
+            if add_price <= 0:
+                st.error("⚠️ Please enter a sales price greater than 0.")
+            elif add_qty > available_stock:
+                st.error("⚠️ Quantity exceeds available stock.")
+            else:
+                existing_idx = next(
+                    (i for i, it in enumerate(st.session_state.sale_cart) if it["medicine_id"] == selected_id), None
+                )
+                if existing_idx is not None:
+                    new_qty = st.session_state.sale_cart[existing_idx]["qty"] + add_qty
+                    if new_qty > available_stock:
+                        st.error("⚠️ Total quantity in cart exceeds available stock.")
+                    else:
+                        st.session_state.sale_cart[existing_idx]["qty"] = new_qty
+                        st.session_state.sale_cart[existing_idx]["unit_price"] = add_price
+                        st.session_state.sale_cart[existing_idx]["subtotal"] = new_qty * add_price
+                else:
+                    st.session_state.sale_cart.append(
+                        {
+                            "medicine_id": int(selected_id),
+                            "name": selected_row["name"],
+                            "medicine_type": selected_row.get("medicine_type", ""),
+                            "qty": int(add_qty),
+                            "unit_price": float(add_price),
+                            "subtotal": int(add_qty) * float(add_price),
                         }
-                        if update_medicine(edit_id, payload):
-                            clear_all_caches()
-                            st.success("✅ Medicine updated successfully!")
-                            st.rerun()
+                    )
+                st.rerun()
 
-                    if delete_btn:
-                        if delete_medicine(edit_id):
-                            clear_all_caches()
-                            st.success("✅ Medicine deleted successfully!")
-                            st.rerun()
+    # ---------- Cart ----------
+    st.markdown("---")
+    st.markdown("##### 🧺 Cart")
+
+    if not st.session_state.sale_cart:
+        st.info("Cart is empty. Search and add products above.")
+        return
+
+    cart_df = pd.DataFrame(st.session_state.sale_cart)
+    cart_display = cart_df.rename(
+        columns={"name": "Product", "medicine_type": "Type", "qty": "Qty", "unit_price": "Unit Price", "subtotal": "Subtotal"}
+    )[["Product", "Type", "Qty", "Unit Price", "Subtotal"]]
+    st.dataframe(cart_display, use_container_width=True, hide_index=True)
+
+    rcol1, rcol2 = st.columns([3, 1])
+    remove_options = [f"{it['name']} (Qty: {it['qty']})" for it in st.session_state.sale_cart]
+    with rcol1:
+        item_to_remove = st.selectbox("Remove an item", remove_options, label_visibility="collapsed")
+    with rcol2:
+        if st.button("🗑️ Remove", use_container_width=True):
+            idx = remove_options.index(item_to_remove)
+            st.session_state.sale_cart.pop(idx)
+            st.rerun()
+
+    subtotal_amount = float(cart_df["subtotal"].sum())
+
+    # ---------- Discount & Customer ----------
+    st.markdown("---")
+    st.markdown("##### 💳 Billing Details")
+
+    discount = st.number_input("Discount (Flat Amount TK)", min_value=0.0, max_value=subtotal_amount, step=1.0)
+    payable_amount = subtotal_amount - discount
+
+    ccol1, ccol2 = st.columns(2)
+    with ccol1:
+        customer_name = st.text_input("Customer Name")
+    with ccol2:
+        customer_phone = st.text_input("Customer Phone")
+
+    payment_mode = st.radio("Payment Mode *", ["Cash", "Credit"], horizontal=True)
+
+    paid_amount = payable_amount
+    if payment_mode == "Credit":
+        paid_amount = st.number_input(
+            "Amount Paid Now (TK)", min_value=0.0, max_value=float(payable_amount), value=0.0, step=1.0
+        )
+    due_amount = max(payable_amount - paid_amount, 0.0)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Subtotal", fmt_money(subtotal_amount))
+    m2.metric("Discount", fmt_money(discount))
+    m3.metric("Total Payable", fmt_money(payable_amount))
+    m4.metric("Due Amount", fmt_money(due_amount))
+
+    if payment_mode == "Credit" and due_amount > 0 and (not customer_name.strip() or not customer_phone.strip()):
+        st.warning("⚠️ Customer Name & Phone are required for Credit sales with a remaining due amount.")
+
+    checkout_disabled = payment_mode == "Credit" and due_amount > 0 and (
+        not customer_name.strip() or not customer_phone.strip()
+    )
+
+    st.markdown("---")
+    if st.button("✅ Checkout & Generate Voucher", use_container_width=True, type="primary", disabled=checkout_disabled):
+        # 1. Re-validate & deduct stock for every cart item
+        stock_ok = True
+        latest_meds_df = fetch_medicines()
+        for item in st.session_state.sale_cart:
+            current_row = latest_meds_df[latest_meds_df["id"] == item["medicine_id"]]
+            if current_row.empty:
+                st.error(f"⚠️ '{item['name']}' no longer exists in inventory.")
+                stock_ok = False
+                continue
+            current_stock = int(current_row.iloc[0]["stock"])
+            new_stock = current_stock - item["qty"]
+            if new_stock < 0:
+                st.error(f"⚠️ Not enough stock for {item['name']}.")
+                stock_ok = False
+                continue
+            update_medicine_stock(item["medicine_id"], new_stock)
+
+        if stock_ok:
+            voucher_no = generate_voucher_no()
+            sale_payload = {
+                "voucher_no": voucher_no,
+                "sale_date": date.today().isoformat(),
+                "customer_name": customer_name.strip() if customer_name.strip() else "Walk-in Customer",
+                "customer_phone": customer_phone.strip(),
+                "items": json.dumps(st.session_state.sale_cart),
+                "subtotal": subtotal_amount,
+                "discount": discount,
+                "total_amount": payable_amount,
+                "payment_mode": payment_mode,
+                "paid_amount": paid_amount if payment_mode == "Credit" else payable_amount,
+                "due_amount": due_amount if payment_mode == "Credit" else 0.0,
+            }
+            saved_sale = insert_sale(sale_payload)
+
+            ledger_ok = True
+            if payment_mode == "Credit" and due_amount > 0:
+                ledger_ok = upsert_customer_due(sale_payload["customer_name"], customer_phone.strip(), due_amount)
+
+            if saved_sale and ledger_ok:
+                clear_all_caches()
+                st.session_state.last_voucher = sale_payload
+                st.session_state.sale_cart = []
+                st.success(f"✅ Sale completed! Voucher No: **{voucher_no}**")
+                st.balloons()
+                st.rerun()
+            else:
+                st.error("❌ Sale could not be fully recorded. Please check the errors above.")
+
+    # ---------- Show the last generated voucher ----------
+    if st.session_state.last_voucher:
+        st.markdown("---")
+        st.markdown("##### 🧾 Voucher / Receipt")
+        st.markdown(render_voucher_html(st.session_state.last_voucher), unsafe_allow_html=True)
+        if st.button("✖️ Clear Voucher Preview", use_container_width=True):
+            st.session_state.last_voucher = None
+            st.rerun()
 
 
 # =================================================================================
-# PAGE 3: POS / BILLING
+# MODULE 3: INVENTORY REPORTS
 # =================================================================================
-def render_pos():
-    st.subheader("🛒 POS / Billing")
+def render_inventory_reports():
+    st.subheader("📦 Inventory Reports")
 
     meds_df = fetch_medicines()
 
     if meds_df.empty:
-        st.info("No medicines available. Please add products in the Inventory module first.")
+        st.info("ℹ️ No inventory records found yet. Add stock from the Purchase module first.")
         return
 
-    in_stock_df = meds_df[meds_df["stock_quantity"] > 0].sort_values("name")
-    if in_stock_df.empty:
-        st.warning("⚠️ All medicines are out of stock.")
-        return
+    total_items = meds_df.shape[0]
+    total_units = int(meds_df["stock"].sum())
+    low_stock_df = meds_df[meds_df["stock"] < 10]
 
-    st.markdown("##### ➕ Add Item to Cart")
-    med_options = in_stock_df.apply(
-        lambda r: f"{r['name']}  |  Stock: {int(r['stock_quantity'])}  |  Price: {fmt_money(r['selling_price'])}  [ID:{r['id']}]",
-        axis=1,
-    ).tolist()
-
-    col1, col2, col3 = st.columns([3, 1.3, 1])
-    with col1:
-        med_choice = st.selectbox("Select Medicine", med_options, label_visibility="collapsed")
-    med_id = int(med_choice.split("[ID:")[1].replace("]", ""))
-    med_row = in_stock_df[in_stock_df["id"] == med_id].iloc[0]
-
-    with col2:
-        sell_qty = st.number_input(
-            "Qty", min_value=1.0, max_value=float(med_row["stock_quantity"]), value=1.0, step=1.0,
-            label_visibility="collapsed",
-        )
-    with col3:
-        add_clicked = st.button("➕ Add", use_container_width=True)
-
-    if add_clicked:
-        if sell_qty > med_row["stock_quantity"]:
-            st.error("⚠️ Not enough stock available.")
-        else:
-            existing_idx = next(
-                (i for i, item in enumerate(st.session_state.cart) if item["id"] == med_id), None
-            )
-            if existing_idx is not None:
-                new_qty = st.session_state.cart[existing_idx]["qty"] + sell_qty
-                if new_qty > med_row["stock_quantity"]:
-                    st.error("⚠️ Total quantity exceeds available stock.")
-                else:
-                    st.session_state.cart[existing_idx]["qty"] = new_qty
-                    st.session_state.cart[existing_idx]["subtotal"] = new_qty * med_row["selling_price"]
-            else:
-                st.session_state.cart.append(
-                    {
-                        "id": int(med_row["id"]),
-                        "name": med_row["name"],
-                        "price": float(med_row["selling_price"]),
-                        "qty": float(sell_qty),
-                        "subtotal": float(sell_qty) * float(med_row["selling_price"]),
-                    }
-                )
-            st.rerun()
+    m1, m2, m3 = st.columns(3)
+    m1.metric("💊 Total Medicine Types", f"{total_items}")
+    m2.metric("📦 Total Stock (Pcs)", f"{total_units} pcs")
+    m3.metric("⚠️ Low Stock Items (<10)", f"{low_stock_df.shape[0]}")
 
     st.markdown("---")
-    st.markdown("##### 🧾 Current Cart")
 
-    if not st.session_state.cart:
-        st.info("Cart is empty. Add medicines above.")
-    else:
-        cart_df = pd.DataFrame(st.session_state.cart)
-        cart_display = cart_df.rename(
-            columns={"name": "Medicine", "price": "Unit Price", "qty": "Qty", "subtotal": "Subtotal"}
-        )[["Medicine", "Unit Price", "Qty", "Subtotal"]]
-        st.dataframe(cart_display, use_container_width=True, hide_index=True)
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        search_term = st.text_input("🔍 Search by Medicine Name")
+    with col2:
+        type_options = ["All Types"] + sorted([t for t in meds_df["medicine_type"].unique().tolist() if t])
+        type_filter = st.selectbox("Filter by Type", type_options)
 
-        remove_options = [f"{item['name']} (Qty: {item['qty']})" for item in st.session_state.cart]
-        rcol1, rcol2 = st.columns([3, 1])
-        with rcol1:
-            item_to_remove = st.selectbox("Remove an item", remove_options, label_visibility="collapsed")
-        with rcol2:
-            if st.button("🗑️ Remove", use_container_width=True):
-                idx = remove_options.index(item_to_remove)
-                st.session_state.cart.pop(idx)
-                st.rerun()
+    display_df = meds_df.copy()
+    if search_term:
+        display_df = display_df[display_df["name"].str.contains(search_term, case=False, na=False)]
+    if type_filter != "All Types":
+        display_df = display_df[display_df["medicine_type"] == type_filter]
 
-        subtotal_amount = float(cart_df["subtotal"].sum())
+    show_df = display_df.rename(
+        columns={"name": "Medicine Name", "medicine_type": "Type", "stock": "Stock (Pcs)"}
+    )
+    columns_to_show = ["Medicine Name", "Type", "Stock (Pcs)"]
+    if "created_at" in display_df.columns:
+        show_df["created_at"] = pd.to_datetime(display_df["created_at"], errors="coerce")
+        show_df["Added On"] = show_df["created_at"].dt.strftime("%Y-%m-%d")
+        columns_to_show.append("Added On")
 
+    st.dataframe(
+        show_df[columns_to_show].sort_values("Medicine Name"),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    if not low_stock_df.empty:
         st.markdown("---")
-        st.markdown("##### 💳 Payment Details")
+        st.markdown("##### ⚠️ Low Stock Alert (below 10 units)")
+        st.dataframe(
+            low_stock_df.rename(columns={"name": "Medicine Name", "medicine_type": "Type", "stock": "Stock (Pcs)"})[
+                ["Medicine Name", "Type", "Stock (Pcs)"]
+            ].sort_values("Stock (Pcs)"),
+            use_container_width=True,
+            hide_index=True,
+        )
 
-        discount = st.number_input("Discount (Flat Amount TK)", min_value=0.0, max_value=subtotal_amount, step=1.0)
-        payable_amount = subtotal_amount - discount
 
-        cust_col1, cust_col2 = st.columns(2)
-        with cust_col1:
-            customer_name = st.text_input("Customer Name")
-        with cust_col2:
-            customer_phone = st.text_input("Customer Phone")
+# =================================================================================
+# MODULE 4: SUPPLIER LEDGER (CREDIT DUE)
+# =================================================================================
+def render_supplier_ledger():
+    st.subheader("🧾 Supplier Ledger — Credit Due")
+    st.caption("Track how much your pharmacy owes each supplier for credit purchases, and settle payments.")
 
-        paid_amount = st.number_input("Amount Paid *", min_value=0.0, value=float(payable_amount), step=1.0)
-        due_amount = max(payable_amount - paid_amount, 0.0)
+    ledger_df = fetch_supplier_ledger()
+    purchases_df = fetch_purchases()
 
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Total Payable", fmt_money(payable_amount))
-        m2.metric("Amount Paid", fmt_money(paid_amount))
-        m3.metric("Remaining Due", fmt_money(due_amount))
+    total_outstanding = 0.0 if ledger_df.empty else float(ledger_df["total_due"].sum())
+    m1, m2 = st.columns(2)
+    m1.metric("🏭 Suppliers with Credit Due", f"{ledger_df[ledger_df['total_due'] > 0].shape[0] if not ledger_df.empty else 0}")
+    m2.metric("💳 Total Outstanding Credit", fmt_money(total_outstanding))
 
-        if due_amount > 0 and (not customer_name.strip() or not customer_phone.strip()):
-            st.warning("⚠️ Customer Name & Phone are required when there is a remaining due amount.")
+    st.markdown("---")
+    st.markdown("##### 🔍 Search Supplier")
+    search_term = st.text_input(
+        "Search by Supplier Name", label_visibility="collapsed", placeholder="Search by Supplier Name"
+    )
 
-        checkout_disabled = due_amount > 0 and (not customer_name.strip() or not customer_phone.strip())
+    display_df = ledger_df.copy()
+    if not display_df.empty and search_term:
+        display_df = display_df[display_df["supplier_name"].str.contains(search_term, case=False, na=False)]
 
-        if st.button("✅ Checkout & Save Bill", use_container_width=True, type="primary", disabled=checkout_disabled):
-            # 1. Deduct stock for each item
-            stock_ok = True
-            for item in st.session_state.cart:
-                current_row = meds_df[meds_df["id"] == item["id"]]
-                if current_row.empty:
-                    stock_ok = False
-                    continue
-                current_stock = float(current_row.iloc[0]["stock_quantity"])
-                new_stock = current_stock - item["qty"]
-                if new_stock < 0:
-                    st.error(f"⚠️ Not enough stock for {item['name']}.")
-                    stock_ok = False
-                    continue
-                update_medicine(item["id"], {"stock_quantity": new_stock})
+    if display_df.empty:
+        st.info("No supplier ledger records found.")
+    else:
+        show_df = display_df.rename(columns={"supplier_name": "Supplier", "total_due": "Outstanding Due (TK)"})
+        st.dataframe(show_df[["Supplier", "Outstanding Due (TK)"]], use_container_width=True, hide_index=True)
 
-            if stock_ok:
-                # 2. Insert sales record
-                sale_payload = {
-                    "sale_date": date.today().isoformat(),
-                    "customer_name": customer_name.strip() if customer_name else "Walk-in Customer",
-                    "customer_phone": customer_phone.strip() if customer_phone else "",
-                    "items": json.dumps(st.session_state.cart),
-                    "total_amount": payable_amount,
-                    "discount": discount,
-                    "paid_amount": paid_amount,
-                    "due_amount": due_amount,
-                }
-                if insert_sale(sale_payload):
-                    # 3. Update customer ledger if there is a due
-                    if due_amount > 0:
-                        upsert_customer_due(customer_name.strip(), customer_phone.strip(), due_amount)
+    st.markdown("---")
+    st.markdown("##### 💵 Pay Supplier (Settle Credit)")
 
+    due_suppliers = ledger_df[ledger_df["total_due"] > 0] if not ledger_df.empty else pd.DataFrame()
+
+    if due_suppliers.empty:
+        st.success("✅ No outstanding credit with any supplier.")
+    else:
+        options = due_suppliers.apply(
+            lambda r: f"{r['supplier_name']}  |  Due: {fmt_money(r['total_due'])}  [ID:{r['id']}]", axis=1
+        ).tolist()
+        selected = st.selectbox("Select Supplier", options)
+        selected_id = int(selected.split("[ID:")[1].replace("]", ""))
+        selected_row = due_suppliers[due_suppliers["id"] == selected_id].iloc[0]
+
+        st.metric("Current Outstanding Due", fmt_money(selected_row["total_due"]))
+
+        paid_now = st.number_input(
+            "Amount Paid Now *", min_value=0.0, max_value=float(selected_row["total_due"]), step=1.0
+        )
+
+        if st.button("💵 Record Payment to Supplier", use_container_width=True, type="primary"):
+            if paid_now <= 0:
+                st.error("⚠️ Enter a valid amount greater than 0.")
+            else:
+                new_due = float(selected_row["total_due"]) - paid_now
+                if pay_supplier(selected_id, new_due):
                     clear_all_caches()
-                    st.success("✅ Sale recorded successfully!")
-                    st.session_state.cart = []
-                    st.rerun()
+                    st.success(f"✅ Payment of {fmt_money(paid_now)} recorded! Remaining due: {fmt_money(new_due)}")
+                    st.balloons()
+
+    st.markdown("---")
+    st.markdown("##### 📜 Credit Purchase History")
+    if purchases_df.empty:
+        st.info("No purchase records yet.")
+    else:
+        credit_df = purchases_df[purchases_df["payment_type"] == "Credit"].copy()
+        if credit_df.empty:
+            st.info("No credit purchases recorded yet.")
+        else:
+            credit_df["purchase_date"] = credit_df["purchase_date"].dt.strftime("%Y-%m-%d")
+            credit_df = credit_df.rename(
+                columns={
+                    "purchase_date": "Date",
+                    "medicine_name": "Medicine",
+                    "supplier_name": "Supplier",
+                    "quantity": "Qty",
+                    "total_amount": "Total (TK)",
+                    "paid_amount": "Paid (TK)",
+                    "due_amount": "Due (TK)",
+                }
+            )
+            st.dataframe(
+                credit_df[["Date", "Medicine", "Supplier", "Qty", "Total (TK)", "Paid (TK)", "Due (TK)"]],
+                use_container_width=True,
+                hide_index=True,
+            )
 
 
 # =================================================================================
-# PAGE 4: CUSTOMER DUE LEDGER
+# MODULE 5: CUSTOMER LEDGER (CREDIT DUE)
 # =================================================================================
-def render_ledger():
-    st.subheader("📗 Customer Due Ledger")
+def render_customer_ledger():
+    st.subheader("📗 Customer Ledger — Credit Due")
+    st.caption("Track how much each customer owes the pharmacy for credit sales, and collect payments.")
 
-    cust_df = fetch_customers()
+    ledger_df = fetch_customer_ledger()
 
+    total_outstanding = 0.0 if ledger_df.empty else float(ledger_df["total_due"].sum())
+    m1, m2 = st.columns(2)
+    m1.metric(
+        "🙍 Customers with Due",
+        f"{ledger_df[ledger_df['total_due'] > 0].shape[0] if not ledger_df.empty else 0}",
+    )
+    m2.metric("💳 Total Outstanding Due", fmt_money(total_outstanding))
+
+    st.markdown("---")
     st.markdown("##### 🔍 Search Customer")
-    search_term = st.text_input("Search by Name or Phone", label_visibility="collapsed", placeholder="Search by Name or Phone")
+    search_term = st.text_input(
+        "Search by Name or Phone", label_visibility="collapsed", placeholder="Search by Name or Phone"
+    )
 
-    display_df = cust_df.copy()
+    display_df = ledger_df.copy()
     if not display_df.empty and search_term:
         mask = display_df["customer_name"].str.contains(search_term, case=False, na=False) | display_df[
             "customer_phone"
@@ -734,17 +1186,17 @@ def render_ledger():
         display_df = display_df[mask]
 
     if display_df.empty:
-        st.info("No customer due records found.")
+        st.info("No customer ledger records found.")
     else:
         show_df = display_df.rename(
-            columns={"customer_name": "Customer Name", "customer_phone": "Phone", "total_due": "Total Due (TK)"}
-        )[["Customer Name", "Phone", "Total Due (TK)"]]
-        st.dataframe(show_df, use_container_width=True, hide_index=True)
+            columns={"customer_name": "Customer", "customer_phone": "Phone", "total_due": "Due (TK)"}
+        )
+        st.dataframe(show_df[["Customer", "Phone", "Due (TK)"]], use_container_width=True, hide_index=True)
 
     st.markdown("---")
-    st.markdown("##### 💰 Receive Payment")
+    st.markdown("##### 💵 Receive Payment")
 
-    due_customers = cust_df[cust_df["total_due"] > 0] if not cust_df.empty else pd.DataFrame()
+    due_customers = ledger_df[ledger_df["total_due"] > 0] if not ledger_df.empty else pd.DataFrame()
 
     if due_customers.empty:
         st.success("✅ No pending dues from any customer.")
@@ -768,27 +1220,26 @@ def render_ledger():
                 st.error("⚠️ Enter a valid amount greater than 0.")
             else:
                 new_due = float(selected_row["total_due"]) - paid_now
-                if receive_payment(selected_id, new_due):
+                if receive_customer_payment(selected_id, new_due):
                     clear_all_caches()
                     st.success(f"✅ Payment of {fmt_money(paid_now)} recorded! Remaining due: {fmt_money(new_due)}")
-                    st.rerun()
+                    st.balloons()
 
 
 # =================================================================================
-# PAGE 5: SALES HISTORY
+# MODULE 6: SALES HISTORY / VOUCHERS
 # =================================================================================
 def render_sales_history():
-    st.subheader("📈 Sales History")
+    st.subheader("🧾 Sales History / Vouchers")
 
     sales_df = fetch_sales()
-
     if sales_df.empty:
         st.info("No sales recorded yet.")
         return
 
     col1, col2 = st.columns(2)
     with col1:
-        start_date = st.date_input("From Date", value=date.today() - timedelta(days=30))
+        start_date = st.date_input("From Date", value=date.today() - pd.Timedelta(days=30))
     with col2:
         end_date = st.date_input("To Date", value=date.today())
 
@@ -815,54 +1266,87 @@ def render_sales_history():
     show_df["sale_date"] = show_df["sale_date"].dt.strftime("%Y-%m-%d")
     show_df = show_df.rename(
         columns={
+            "voucher_no": "Voucher No",
             "sale_date": "Date",
             "customer_name": "Customer",
             "customer_phone": "Phone",
+            "payment_mode": "Payment",
             "total_amount": "Total (TK)",
-            "discount": "Discount (TK)",
             "paid_amount": "Paid (TK)",
             "due_amount": "Due (TK)",
         }
     )
     st.dataframe(
-        show_df[["Date", "Customer", "Phone", "Total (TK)", "Discount (TK)", "Paid (TK)", "Due (TK)"]],
+        show_df[["Voucher No", "Date", "Customer", "Phone", "Payment", "Total (TK)", "Paid (TK)", "Due (TK)"]],
         use_container_width=True,
         hide_index=True,
     )
 
     st.markdown("---")
-    st.markdown("##### 🧾 View Bill Details")
-    bill_options = filtered_df.apply(
-        lambda r: f"{r['sale_date'].strftime('%Y-%m-%d')} - {r['customer_name']} - {fmt_money(r['total_amount'])}  [ID:{r['id']}]",
-        axis=1,
+    st.markdown("##### 🧾 View / Reprint a Voucher")
+    voucher_options = filtered_df.apply(
+        lambda r: f"{r['voucher_no']}  ·  {r['customer_name']}  ·  {fmt_money(r['total_amount'])}", axis=1
     ).tolist()
-    bill_selected = st.selectbox("Select a bill to view items", bill_options)
-    bill_id = int(bill_selected.split("[ID:")[1].replace("]", ""))
-    bill_row = filtered_df[filtered_df["id"] == bill_id].iloc[0]
+    voucher_lookup = dict(zip(voucher_options, filtered_df["voucher_no"]))
+    selected_voucher_label = st.selectbox("Select a voucher", voucher_options)
+    selected_voucher_no = voucher_lookup[selected_voucher_label]
+    voucher_row = filtered_df[filtered_df["voucher_no"] == selected_voucher_no].iloc[0].to_dict()
 
+    st.markdown(render_voucher_html(voucher_row), unsafe_allow_html=True)
+
+
+
+# =================================================================================
+# MODULE 7: SETTINGS
+# =================================================================================
+def render_settings():
+    st.subheader("⚙️ Settings")
+
+    st.markdown("##### 🔌 Connection Status")
     try:
-        items = json.loads(bill_row["items"]) if bill_row["items"] else []
-        if items:
-            items_df = pd.DataFrame(items).rename(
-                columns={"name": "Medicine", "price": "Unit Price", "qty": "Qty", "subtotal": "Subtotal"}
-            )[["Medicine", "Unit Price", "Qty", "Subtotal"]]
-            st.dataframe(items_df, use_container_width=True, hide_index=True)
-        else:
-            st.info("No item details available for this bill.")
-    except Exception:
-        st.info("Could not parse item details for this bill.")
+        supabase.table("medicines").select("id").limit(1).execute()
+        st.success("✅ Connected to Supabase successfully.")
+    except Exception as e:
+        st.error(f"❌ Supabase connection issue: {e}")
+
+    st.markdown("---")
+    st.markdown("##### 🗂️ Master Medicine Catalogue")
+    master_df = fetch_master_medicines()
+    if master_df.empty:
+        st.info("No records found in `master_medicines`.")
+    else:
+        st.write(f"Total catalogue entries: **{master_df.shape[0]}**")
+        with st.expander("View Master Catalogue"):
+            cols = [c for c in ["brand_name", "generic_name", "company_name", "form"] if c in master_df.columns]
+            st.dataframe(master_df[cols], use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.markdown("##### 🧹 Cache Management")
+    st.caption("Data is cached for 20 seconds for faster performance. Force a refresh if you just updated data elsewhere.")
+    if st.button("🔄 Clear Cache & Refresh Now", use_container_width=True):
+        clear_all_caches()
+        st.success("✅ Cache cleared successfully.")
+        st.rerun()
+
+    st.markdown("---")
+    st.markdown("##### ℹ️ About")
+    st.caption("Med Life Pharmacy ERP · Built with Streamlit + Supabase")
 
 
 # =================================================================================
 # ROUTER
 # =================================================================================
-if page.startswith("📊"):
-    render_dashboard()
-elif page.startswith("💊"):
-    render_inventory()
-elif page.startswith("🛒"):
-    render_pos()
-elif page.startswith("📗"):
-    render_ledger()
-elif page.startswith("📈"):
+if page == "➕ Purchase / Stock Entry":
+    render_purchase()
+elif page == "🛒 Sales Module":
+    render_sales()
+elif page == "📦 Inventory Reports":
+    render_inventory_reports()
+elif page == "🧾 Supplier Ledger (Credit Due)":
+    render_supplier_ledger()
+elif page == "📗 Customer Ledger (Credit Due)":
+    render_customer_ledger()
+elif page == "🧾 Sales History / Vouchers":
     render_sales_history()
+elif page == "⚙️ Settings":
+    render_settings()
