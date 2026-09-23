@@ -42,6 +42,7 @@ also shows this SQL on-screen (Settings / Reports Hub) if a table is missing.
    -- (2) Expiry + batch columns on purchase & opening stock history
    alter table purchases     add column if not exists expiry_date date;
    alter table purchases     add column if not exists batch_no text;
+   alter table purchases     add column if not exists invoice_no text;
    alter table opening_stock add column if not exists expiry_date date;
    alter table opening_stock add column if not exists batch_no text;
 
@@ -152,6 +153,7 @@ create index if not exists idx_batches_name on medicine_batches (medicine_name);
 create index if not exists idx_batches_expiry on medicine_batches (expiry_date);
 alter table purchases     add column if not exists expiry_date date;
 alter table purchases     add column if not exists batch_no text;
+alter table purchases     add column if not exists invoice_no text;
 alter table opening_stock add column if not exists expiry_date date;
 alter table opening_stock add column if not exists batch_no text;
 alter table medicines     add column if not exists sale_price numeric default 0;"""
@@ -211,13 +213,13 @@ st.markdown(
     """
     <style>
         .stApp { background-color: #f4f6f8; }
-        .block-container { padding-top: 0.8rem; padding-bottom: 0.8rem; }
+        .block-container { padding-top: 3.4rem; padding-bottom: 0.8rem; }
         div[data-testid="stVerticalBlock"] { gap: 0.55rem; }
         label[data-testid="stWidgetLabel"] p { font-size: 0.78rem; font-weight: 600; margin-bottom: 0; color: #1e3a8a; }
 
         .erp-header {
             background: linear-gradient(90deg, #0b3d33 0%, #0f766e 60%, #14b8a6 100%);
-            padding: 10px 22px; border-radius: 10px 10px 0 0; color: white;
+            padding: 10px 22px; border-radius: 10px; color: white; margin-top: 0.3rem;
         }
         .erp-header h1 { margin: 0; font-size: 1.3rem; font-weight: 700; color: white; }
         .erp-header p { margin: 2px 0 0 0; font-size: 0.78rem; opacity: 0.9; }
@@ -1019,8 +1021,9 @@ def write_off_batch(batch_id: int, med_name: str, qty: int) -> bool:
         return False
 
 
-def insert_purchase(payload: dict) -> bool:
-    return _insert_fallback("purchases", payload, ("expiry_date", "batch_no"))
+def insert_purchase(payload) -> bool:
+    """Accepts a single purchase dict OR a list of dicts (one multi-item invoice)."""
+    return _insert_fallback("purchases", payload, ("expiry_date", "batch_no", "invoice_no"))
 
 
 def log_txn(party_type, party_key, party_name, txn_type, ref_no, due_added, paid, balance_after):
@@ -1195,7 +1198,12 @@ def build_excel(sheets: dict) -> bytes:
             df.to_excel(writer, sheet_name=safe, index=False)
             ws = writer.sheets[safe]
             for i, col in enumerate(df.columns, start=1):
-                width = min(max(12, int(df[col].astype(str).str.len().clip(upper=40).max() or 12) + 2), 42)
+                if len(df) > 0:
+                    longest = df[col].astype(str).str.len().clip(upper=40).max()
+                    longest = 12 if pd.isna(longest) else int(longest)
+                else:
+                    longest = 12
+                width = min(max(12, longest + 2), 42)
                 ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = width
     return buf.getvalue()
 
@@ -1442,23 +1450,48 @@ st.sidebar.markdown(f'<div class="arj-credit">{CREDIT_TEXT}</div>', unsafe_allow
 # SHARED WIDGETS: medicine picker, Box/Pcs row, Expiry row
 # =================================================================================
 def medicine_picker(prefix: str):
-    """Search box + short result list (fast even with 20,000+ catalogue rows).
-    Returns (selected_label or None, medicine_name or None, form_hint)."""
+    """Explicit toggle between 'pick an existing medicine' and 'add a brand-new one' —
+    this avoids the old confusing disabled/greyed 'New Medicine Name' box.
+    Returns (is_new: bool, medicine_name or None, form_hint: str)."""
+    mode = st.radio("Medicine source", ["🔍 Pick Existing Medicine", "🆕 Add a Brand-New Medicine"],
+                    horizontal=True, key=f"{prefix}_mode", label_visibility="collapsed")
+    is_new = mode.startswith("🆕")
+
+    if is_new:
+        name = st.text_input("New Medicine Name *", placeholder="Type the medicine name (e.g. Napa 500mg)",
+                             key=f"{prefix}_newname")
+        return True, (name.strip() or None), ""
+
     pick = get_pick_list()
-    q = st.text_input("🔍 Search medicine", key=f"{prefix}_q", placeholder="type a few letters…")
-    if q.strip():
-        mask = pd.Series(True, index=pick.index)
-        for term in q.lower().split():
-            mask &= pick["lc"].str.contains(term, regex=False)
-        res = pick[mask].head(80)
-    else:
-        res = pick.head(80)
-    labels = res["label"].tolist() + [NEW_CUSTOM_LABEL]
-    sel = st.selectbox("Medicine *", labels, index=None, placeholder="Select — or choose New at the bottom",
-                       key=f"{prefix}_sel")
-    name_map = dict(zip(res["label"], res["name"]))
-    form_map = dict(zip(res["label"], res["form"]))
-    return sel, name_map.get(sel), form_map.get(sel, "")
+    if pick.empty:
+        st.error("⚠️ কোনো medicine data লোড হয়নি (আপনার stock-ও শূন্য দেখাচ্ছে, catalogue-ও)। "
+                "এর মানে app আপনার Supabase থেকে ডেটা পড়তে পারছে না। সাধারণত এর কারণ **Row Level "
+                "Security (RLS)** — Supabase-এ `medicines` টেবিলে SELECT policy না থাকলে ডেটা থাকলেও app "
+                "কিছু দেখতে পায় না। Supabase → Authentication → Policies-এ গিয়ে `medicines` (ও অন্য টেবিল) "
+                "টেবিলে read/write policy দিন, তারপর Sidebar থেকে 🔄 Refresh Data চাপুন।")
+        return True, None, ""
+
+    # A single selectbox with EVERY option loaded has its own built-in type-ahead search —
+    # click it and type; it filters live, letter by letter, with no Enter key and no server round-trip.
+    MAX_OPTIONS = 3000
+    options_df = pick if len(pick) <= MAX_OPTIONS else pick.head(MAX_OPTIONS)
+    if len(pick) > MAX_OPTIONS:
+        st.caption(f"⚠️ {len(pick)}টা medicine আছে — dropdown-এ প্রথম {MAX_OPTIONS}টা লোড করা হয়েছে। "
+                  "খুঁজে না পেলে '🆕 Add a Brand-New Medicine' ব্যবহার করুন।")
+
+    labels = options_df["label"].tolist()
+    sel = st.selectbox("Medicine *  (এখানে ক্লিক করে সরাসরি টাইপ করুন)", labels, index=None,
+                       placeholder="টাইপ করুন… যেমন Ace, Napa, Zimax", key=f"{prefix}_sel")
+    name_map = dict(zip(options_df["label"], options_df["name"]))
+    form_map = dict(zip(options_df["label"], options_df["form"]))
+
+    n_mine = int(pick["label"].str.endswith("[my stock]").sum())
+    n_cat = len(pick) - n_mine
+    st.caption(f"ℹ️ মোট {len(pick)}টা medicine লোড হয়েছে  —  নিজের stock: **{n_mine}**টা  ·  Catalogue: **{n_cat}**টা")
+    if st.checkbox("👀 লোড হওয়া সব medicine-এর নাম দেখান (spelling মিলিয়ে দেখতে)", key=f"{prefix}_showall"):
+        st.dataframe(pick[["name"]].rename(columns={"name": "Loaded Medicine Names"}), hide_index=True, height=220, **STRETCH)
+
+    return False, name_map.get(sel), form_map.get(sel, "")
 
 
 def qty_row(prefix: str):
@@ -1541,162 +1574,225 @@ def date_range_picker(prefix: str, default: str = "This Month"):
 
 
 # =================================================================================
-# PAGE: PURCHASE ENTRY  (row style)
+# PAGE: PURCHASE ENTRY  (multi-item invoice — add many medicines, save once)
 # =================================================================================
+def generate_invoice_no() -> str:
+    return f"PUR-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{random.randint(100, 999)}"
+
+
 def render_purchase():
     supplier_options = [NEW_SUPPLIER_LABEL] + fetch_supplier_names()
+    if "purchase_cart" not in st.session_state:
+        st.session_state.purchase_cart = []
+    if "purchase_cart_ver" not in st.session_state:
+        st.session_state.purchase_cart_ver = 0
+    pv = st.session_state.purchase_cart_ver
 
-    if "purchase_form_version" not in st.session_state:
-        st.session_state.purchase_form_version = 0
-    v = st.session_state.purchase_form_version
+    st.caption("This is one invoice: add every medicine you bought from this supplier below, "
+              "then fill the supplier & payment details once and save the whole invoice together — "
+              "exactly like a real purchase bill.")
 
+    # ---------- Add item to cart ----------
     with st.container(border=True):
-        sec("Purchase Reference")
-        r1 = st.columns([1, 1.5, 1.5, 1, 1])
+        sec("Add Medicine to This Invoice")
+        r1 = st.columns([2.4, 1.6])
         with r1[0]:
-            pur_date = st.date_input("Purchase Date", value=date.today(), key=f"pur_date_{v}")
-        with r1[1]:
-            sel_supplier = st.selectbox("Supplier / Company *", supplier_options, key=f"pur_supp_{v}")
-        with r1[2]:
-            custom_supplier = st.text_input(
-                "New Supplier Name", placeholder="only if new supplier", key=f"pur_custom_supp_{v}",
-                disabled=sel_supplier != NEW_SUPPLIER_LABEL)
-        with r1[3]:
-            payment_type = st.selectbox("Payment Type *", ["Cash", "Credit"], key=f"pur_pay_{v}")
-        with r1[4]:
-            total_amount = st.number_input("Total Amount (TK) *", min_value=0.0, value=0.0, step=1.0, key=f"pur_total_{v}")
-
-        r2 = st.columns([1, 1, 3])
-        bad_paid = False
-        with r2[0]:
-            if payment_type == "Credit":
-                paid_amount = st.number_input("Paid Now (TK)", min_value=0.0, value=0.0, step=1.0, key=f"pur_paid_{v}")
-                if paid_amount > total_amount:
-                    bad_paid = True
-            else:
-                paid_amount = total_amount
-                st.text_input("Paid Now (TK)", value=f"{total_amount:,.2f}", disabled=True, key=f"pur_paid_auto_{v}")
-        due_amount = max(total_amount - paid_amount, 0.0)
-        with r2[1]:
-            st.text_input("Due (TK)", value=f"{due_amount:,.2f}", disabled=True, key=f"pur_due_auto_{v}")
-        with r2[2]:
-            if bad_paid:
-                st.error("⚠️ Paid amount cannot be more than the total amount.")
-            elif payment_type == "Credit" and due_amount > 0:
-                st.info(f"📌 Credit due for this purchase: **{fmt_money(due_amount)}**")
-
-    with st.container(border=True):
-        sec("Item Details")
-        r3 = st.columns([2.2, 1.6, 1.2, 1.2])
-        with r3[0]:
-            sel_med, picked_name, hint = medicine_picker(f"pur_{v}")
-        is_new = sel_med == NEW_CUSTOM_LABEL
-        with r3[1]:
-            custom_name = st.text_input(
-                "New Medicine Name", placeholder="only if new medicine", key=f"pur_custom_name_{v}", disabled=not is_new)
+            is_new, final_name, hint = medicine_picker(f"pur_add_{pv}")
         default_idx = next((i for i, t in enumerate(MEDICINE_TYPES) if hint and t.lower().startswith(hint.lower()[:4])), 0)
-        with r3[2]:
-            # key includes the selected medicine so the type follows the selection
+        with r1[1]:
             medicine_type = st.selectbox("Medicine Type *", MEDICINE_TYPES, index=default_idx,
-                                         key=f"pur_type_{v}_{zlib.crc32((sel_med or '').encode())}")
-        with r3[3]:
-            custom_type = st.text_input(
-                "Specify Type", placeholder="if 'Other'", key=f"pur_custom_type_{v}", disabled=medicine_type != "Other")
+                                         key=f"pur_add_type_{pv}_{zlib.crc32((final_name or '').encode())}")
+        custom_type = ""
+        if medicine_type == "Other":
+            custom_type = st.text_input("Specify Type", key=f"pur_add_ctype_{pv}")
 
-        unit, box_quantity, units_per_box, total_pcs = qty_row(f"pur_{v}")
-        batch_no, expiry, sale_price = expiry_row(f"pur_{v}", with_sale_price=True)
+        unit, box_quantity, units_per_box, total_pcs = qty_row(f"pur_add_{pv}")
+        batch_no, expiry, _ = expiry_row(f"pur_add_{pv}")
 
-        b1, b2, b3 = st.columns([1.2, 1, 3])
-        with b1:
-            save_clicked = st.button("💾 Save Purchase", type="primary", key=f"pur_submit_{v}", disabled=bad_paid, **STRETCH)
-        with b2:
-            if st.button("↺ Clear Form", key=f"pur_refresh_{v}", **STRETCH):
-                st.session_state.purchase_form_version += 1
+        r3 = st.columns([1, 1, 1])
+        with r3[0]:
+            unit_cost = st.number_input("Unit Cost / pc (TK) *", min_value=0.0, value=0.0, step=0.5, key=f"pur_add_cost_{pv}")
+        with r3[1]:
+            item_sale_price = st.number_input("Sale Price / pc (optional)", min_value=0.0, value=0.0, step=0.5,
+                                              key=f"pur_add_sp_{pv}", help="Auto-fills the price in Sales / POS")
+        with r3[2]:
+            spacer_line()
+            add_clicked = st.button("➕ Add to Invoice", type="primary", key=f"pur_add_btn_{pv}", **STRETCH)
+
+        if add_clicked:
+            final_type = custom_type.strip() if medicine_type == "Other" else medicine_type
+            errs = []
+            if not final_name:
+                errs.append("Please select an existing medicine, or type a name under '🆕 Add a Brand-New Medicine'.")
+            if medicine_type == "Other" and not final_type:
+                errs.append("Please specify the custom medicine type.")
+            if total_pcs <= 0:
+                errs.append("Quantity must be greater than 0.")
+            if unit_cost <= 0:
+                errs.append("Unit cost must be greater than 0.")
+            if errs:
+                for e in errs:
+                    st.error(f"⚠️ {e}")
+            else:
+                st.session_state.purchase_cart.append({
+                    "name": final_name, "mtype": final_type, "unit": unit, "boxes": box_quantity, "ppb": units_per_box,
+                    "qty": total_pcs, "batch_no": batch_no, "expiry": expiry.isoformat() if expiry else None,
+                    "expiry_disp": expiry.strftime("%m/%Y") if expiry else "-",
+                    "unit_cost": float(unit_cost), "sale_price": float(item_sale_price),
+                    "line_total": round(total_pcs * unit_cost, 2)})
+                st.session_state.purchase_cart_ver += 1
                 st.rerun()
 
-    if save_clicked:
-        final_name = custom_name.strip() if is_new else (picked_name or "")
-        final_type = custom_type.strip() if medicine_type == "Other" else medicine_type
-        final_supplier = custom_supplier.strip() if sel_supplier == NEW_SUPPLIER_LABEL else sel_supplier
+    if not st.session_state.purchase_cart:
+        st.info("No items added yet. Add your first medicine above.")
+        _recent_purchases_block()
+        return
 
-        errors = []
-        if sel_med is None:
-            errors.append("Please select a medicine (or choose 'New / Custom').")
-        elif not final_name:
-            errors.append("Medicine name is required.")
-        if medicine_type == "Other" and not final_type:
-            errors.append("Please specify the custom medicine type.")
-        if not final_supplier:
-            errors.append("Supplier / company name is required.")
-        if total_pcs <= 0:
-            errors.append("Quantity must be greater than 0.")
-        if total_amount <= 0:
-            errors.append("Total purchase amount must be greater than 0.")
-        if errors:
-            for err in errors:
-                st.error(f"⚠️ {err}")
-            st.stop()
+    cart = st.session_state.purchase_cart
 
-        # 1) purchase record first -> if it fails nothing else has changed
-        purchase_ok = insert_purchase({
-            "purchase_date": pur_date.isoformat(),
-            "medicine_name": final_name,
-            "medicine_type": final_type,
-            "supplier_name": final_supplier,
-            "purchase_unit": "Box" if unit == UNIT_BOX else "Pcs",
-            "box_quantity": box_quantity,
-            "units_per_box": units_per_box,
-            "quantity": total_pcs,
-            "payment_type": payment_type,
-            "total_amount": total_amount,
-            "paid_amount": paid_amount if payment_type == "Credit" else total_amount,
-            "due_amount": due_amount if payment_type == "Credit" else 0.0,
-            "expiry_date": expiry.isoformat() if expiry else None,
-            "batch_no": batch_no,
-        })
-        if not purchase_ok:
-            st.stop()
+    left, right = st.columns([1.6, 1])
 
-        # 2) stock + batch + average cost (for Profit & Loss)
-        existing_before = find_medicine_by_name(final_name)
-        prev_stock = int(existing_before["stock"]) if existing_before else 0
-        stock_ok, stock_msg = save_or_restock(final_name, total_pcs, final_type, sale_price)
-        if stock_ok:
-            unit_cost = round(total_amount / total_pcs, 4) if total_pcs > 0 else 0
-            update_avg_cost(final_name, total_pcs, unit_cost, prev_stock)
-            if expiry:
-                add_batches([batch_row(final_name, final_type, batch_no, expiry, total_pcs, "Purchase")])
+    # ---------- Cart (editable) ----------
+    with left:
+        with st.container(border=True):
+            sec(f"Invoice Items ({len(cart)})  —  edit Qty / Unit Cost directly, tick Remove to delete")
+            view = pd.DataFrame(cart)[["name", "mtype", "qty", "expiry_disp", "unit_cost", "line_total"]].rename(
+                columns={"name": "Medicine", "mtype": "Type", "qty": "Qty", "expiry_disp": "Expiry",
+                        "unit_cost": "Unit Cost", "line_total": "Line Total"})
+            view["Remove"] = False
+            edited = st.data_editor(
+                view, key=f"pur_cart_editor_{pv}", hide_index=True,
+                disabled=["Medicine", "Type", "Expiry", "Line Total"], height=min(320, 90 + 36 * len(cart)),
+                column_config={
+                    "Qty": st.column_config.NumberColumn(min_value=1, step=1),
+                    "Unit Cost": st.column_config.NumberColumn(min_value=0.0, step=0.5, format="%.2f"),
+                    "Remove": st.column_config.CheckboxColumn("Remove"),
+                }, **STRETCH)
 
-        # 3) supplier ledger
-        ledger_ok = True
-        if payment_type == "Credit" and due_amount > 0:
-            new_bal = upsert_supplier_due(final_supplier, due_amount)
-            ledger_ok = new_bal is not None
-            if ledger_ok:
-                log_txn("supplier", final_supplier, final_supplier, "Credit Purchase", final_name, due_amount, 0, new_bal)
+            new_cart, removed = [], False
+            for i, row in edited.iterrows():
+                if bool(row["Remove"]):
+                    removed = True
+                    continue
+                it = dict(cart[i])
+                qty = max(int(row["Qty"]) if pd.notna(row["Qty"]) else it["qty"], 1)
+                cost = float(row["Unit Cost"]) if pd.notna(row["Unit Cost"]) else it["unit_cost"]
+                it.update(qty=qty, unit_cost=cost, line_total=round(qty * cost, 2))
+                new_cart.append(it)
+            st.session_state.purchase_cart = new_cart
+            if removed:
+                st.session_state.purchase_cart_ver += 1
+                st.rerun()
+            if st.button("🗑️ Clear All Items", key=f"pur_clear_{pv}"):
+                st.session_state.purchase_cart = []
+                st.session_state.purchase_cart_ver += 1
+                st.rerun()
 
-        if stock_ok and ledger_ok:
-            clear_data_caches()
-            st.session_state.purchase_form_version += 1
-            st.session_state.purchase_flash = (
-                f"✅ {stock_msg}  |  🧾 {payment_type} — {total_pcs} pcs — Total: {fmt_money(total_amount)}"
-                + (f" | Exp: {expiry.strftime('%m/%Y')}" if expiry else "")
-                + (f" | Due: {fmt_money(due_amount)}" if payment_type == "Credit" and due_amount > 0 else "")
-            )
-            st.rerun()
-        else:
-            st.error("❌ Purchase was recorded but stock or ledger update had a problem. Please check Inventory / Ledger.")
+    cart = st.session_state.purchase_cart
+    total_amount = round(sum(it["line_total"] for it in cart), 2)
+
+    # ---------- Invoice-level supplier / payment / save ----------
+    with right:
+        with st.container(border=True):
+            sec("Invoice Details")
+            pur_date = st.date_input("Purchase Date", value=date.today(), key="pur_inv_date")
+            sel_supplier = st.selectbox("Supplier / Company *", supplier_options, index=None,
+                                        placeholder="Select supplier", key="pur_inv_supp")
+            custom_supplier = ""
+            if sel_supplier == NEW_SUPPLIER_LABEL:
+                custom_supplier = st.text_input("New Supplier Name", key="pur_inv_custom_supp")
+            payment_type = st.selectbox("Payment Type *", ["Cash", "Credit"], key="pur_inv_pay")
+
+            bad_paid = False
+            if payment_type == "Credit":
+                paid_amount = st.number_input("Paid Now (TK)", min_value=0.0, value=0.0, step=1.0, key="pur_inv_paid")
+                bad_paid = paid_amount > total_amount
+            else:
+                paid_amount = total_amount
+                st.text_input("Paid Now (TK)", value=f"{total_amount:,.2f}", disabled=True, key="pur_inv_paid_ro")
+            due_amount = max(round(total_amount - paid_amount, 2), 0.0)
+
+            st.metric("Invoice Total", fmt_money(total_amount))
+            st.metric("Due", fmt_money(due_amount))
+            if bad_paid:
+                st.error("⚠️ Paid amount cannot be more than the invoice total.")
+
+            final_supplier = custom_supplier.strip() if sel_supplier == NEW_SUPPLIER_LABEL else (sel_supplier or "")
+            ready = bool(final_supplier) and len(cart) > 0 and not bad_paid
+
+            if st.button("💾 Save Purchase Invoice", type="primary", disabled=not ready, **STRETCH):
+                invoice_no = generate_invoice_no()
+                item_subtotals = [it["line_total"] for it in cart]
+                remaining_paid = paid_amount if payment_type == "Credit" else total_amount
+                rows, avg_cost_jobs, batch_jobs = [], [], []
+                for i, it in enumerate(cart):
+                    sub = item_subtotals[i]
+                    if payment_type == "Credit":
+                        item_paid = round(remaining_paid, 2) if i == len(cart) - 1 else (
+                            round(sub / total_amount * paid_amount, 2) if total_amount > 0 else 0.0)
+                        remaining_paid -= item_paid
+                    else:
+                        item_paid = sub
+                    item_due = max(round(sub - item_paid, 2), 0.0)
+                    rows.append({
+                        "purchase_date": pur_date.isoformat(), "medicine_name": it["name"], "medicine_type": it["mtype"],
+                        "supplier_name": final_supplier, "purchase_unit": "Box" if it["unit"] == UNIT_BOX else "Pcs",
+                        "box_quantity": it["boxes"], "units_per_box": it["ppb"], "quantity": it["qty"],
+                        "payment_type": payment_type, "total_amount": sub,
+                        "paid_amount": item_paid if payment_type == "Credit" else sub,
+                        "due_amount": item_due if payment_type == "Credit" else 0.0,
+                        "expiry_date": it["expiry"], "batch_no": it["batch_no"], "invoice_no": invoice_no,
+                    })
+                purchase_ok = insert_purchase(rows)
+                if not purchase_ok:
+                    st.stop()
+
+                stock_msgs = []
+                for it in cart:
+                    existing_before = find_medicine_by_name(it["name"])
+                    prev_stock = int(existing_before["stock"]) if existing_before else 0
+                    ok, msg = save_or_restock(it["name"], it["qty"], it["mtype"], it["sale_price"])
+                    if ok:
+                        update_avg_cost(it["name"], it["qty"], it["unit_cost"], prev_stock)
+                        if it["expiry"]:
+                            add_batches([batch_row(it["name"], it["mtype"], it["batch_no"],
+                                                   datetime.fromisoformat(it["expiry"]).date(), it["qty"], "Purchase")])
+                        stock_msgs.append(f"{it['name']} +{it['qty']}")
+
+                ledger_ok = True
+                if payment_type == "Credit" and due_amount > 0:
+                    new_bal = upsert_supplier_due(final_supplier, due_amount)
+                    ledger_ok = new_bal is not None
+                    if ledger_ok:
+                        log_txn("supplier", final_supplier, final_supplier, "Credit Purchase",
+                                invoice_no, due_amount, 0, new_bal)
+
+                if ledger_ok:
+                    clear_data_caches()
+                    st.session_state.purchase_cart = []
+                    st.session_state.purchase_cart_ver += 1
+                    st.session_state.purchase_flash = (
+                        f"✅ Invoice {invoice_no} saved — {len(rows)} item(s), Total: {fmt_money(total_amount)}"
+                        + (f" | Due: {fmt_money(due_amount)}" if payment_type == "Credit" and due_amount > 0 else "")
+                    )
+                    st.rerun()
+                else:
+                    st.error("❌ Invoice items were saved but the supplier ledger update had a problem. Please check Supplier Ledger.")
 
     if st.session_state.get("purchase_flash"):
         st.success(st.session_state.pop("purchase_flash"))
 
+    _recent_purchases_block()
+
+
+def _recent_purchases_block():
     with st.container(border=True):
         sec("Recent Purchases")
-        purchases_df = fetch_purchases(limit=10)
+        purchases_df = fetch_purchases(limit=15)
         if purchases_df.empty:
             st.info("No purchase records yet.")
         else:
-            st.dataframe(_purchase_display(purchases_df)[0], hide_index=True, height=250, **STRETCH)
+            st.dataframe(_purchase_display(purchases_df)[0], hide_index=True, height=280, **STRETCH)
 
 
 def _purchase_display(df: pd.DataFrame):
@@ -1711,11 +1807,13 @@ def _purchase_display(df: pd.DataFrame):
 
     recent["Purchased As"] = recent.apply(describe_unit, axis=1)
     recent["Expiry"] = recent["expiry_date"].apply(fmt_exp) if "expiry_date" in recent.columns else "-"
+    recent["Invoice"] = recent["invoice_no"].fillna("-") if "invoice_no" in recent.columns else "-"
     recent = recent.rename(columns={
         "purchase_date": "Date", "medicine_name": "Medicine", "medicine_type": "Type", "supplier_name": "Supplier",
         "quantity": "Total Pcs", "payment_type": "Payment", "total_amount": "Total (TK)",
         "paid_amount": "Paid (TK)", "due_amount": "Due (TK)"})
-    cols = ["Date", "Medicine", "Type", "Supplier", "Purchased As", "Expiry", "Total Pcs", "Payment", "Total (TK)", "Paid (TK)", "Due (TK)"]
+    cols = ["Invoice", "Date", "Medicine", "Type", "Supplier", "Purchased As", "Expiry", "Total Pcs", "Payment",
+            "Total (TK)", "Paid (TK)", "Due (TK)"]
     return recent[cols], cols
 
 
@@ -1782,18 +1880,14 @@ def render_opening_stock():
 
             with st.container(border=True):
                 sec("Item Details")
-                r1 = st.columns([2.2, 1.6, 1.2, 1.2])
+                r1 = st.columns([2.4, 1.2, 1.2])
                 with r1[0]:
-                    sel, picked_name, hint = medicine_picker(f"op_{ov}")
-                is_new = sel == NEW_CUSTOM_LABEL
-                with r1[1]:
-                    custom = st.text_input("New Medicine Name", placeholder="only if new medicine",
-                                           key=f"op_custom_{ov}", disabled=not is_new)
+                    is_new, name, hint = medicine_picker(f"op_{ov}")
                 default_idx = next((i for i, t in enumerate(MEDICINE_TYPES) if hint and t.lower().startswith(hint.lower()[:4])), 0)
-                with r1[2]:
+                with r1[1]:
                     mtype = st.selectbox("Medicine Type *", MEDICINE_TYPES, index=default_idx,
-                                         key=f"op_type_{ov}_{zlib.crc32((sel or '').encode())}")
-                with r1[3]:
+                                         key=f"op_type_{ov}_{zlib.crc32((name or '').encode())}")
+                with r1[2]:
                     entry_date = st.date_input("Stock as of date", value=date.today(), key=f"op_date_{ov}")
 
                 unit, boxes, ppb, total_pcs = qty_row(f"op_{ov}")
@@ -1814,11 +1908,8 @@ def render_opening_stock():
                         st.rerun()
 
             if save_open:
-                name = custom.strip() if is_new else (picked_name or "")
-                if sel is None:
-                    st.error("⚠️ Please select a medicine (or choose 'New / Custom').")
-                elif not name:
-                    st.error("⚠️ Medicine name is required.")
+                if not name:
+                    st.error("⚠️ Please select an existing medicine, or type a name under '🆕 Add a Brand-New Medicine'.")
                 else:
                     existing_before = find_medicine_by_name(name)
                     prev_stock = int(existing_before["stock"]) if existing_before else 0
@@ -2680,7 +2771,7 @@ def render_reports_hub():
         export_buttons("rh_purch", f"purchase_report_{start}_{end}",
                        dict(title="Purchase Report", subtitle=label, headers=cols,
                            rows=[[str(v) for v in r] for r in show.itertuples(index=False)],
-                           weights=[1.1, 2.2, 1, 1.8, 1.4, 1, 0.9, 1, 1.1, 1, 1], landscape_mode=True),
+                           weights=[1.4, 1.1, 2.2, 1, 1.8, 1.4, 1, 0.9, 1, 1.1, 1, 1], landscape_mode=True),
                        {"Purchases": show})
 
     elif report == "📦 Stock / Inventory Report":
