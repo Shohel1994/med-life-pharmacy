@@ -107,6 +107,7 @@ from xml.sax.saxutils import escape
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from supabase import create_client, Client
 
 from reportlab.lib import colors
@@ -459,7 +460,7 @@ def get_pick_list() -> pd.DataFrame:
     if not meds.empty:
         for nm, tp in zip(meds["name"], meds["medicine_type"]):
             if str(nm).strip() and str(nm).lower() not in seen:
-                rows.append((f"{nm}  [my stock]", str(nm), str(tp)))
+                rows.append((f"{nm} [my stock]", str(nm), str(tp)))
     rows.extend(master_rows)
     df = pd.DataFrame(rows, columns=["label", "name", "form"])
     df["lc"] = df["label"].str.lower()
@@ -1480,8 +1481,10 @@ def medicine_picker(prefix: str):
                   "খুঁজে না পেলে '🆕 Add a Brand-New Medicine' ব্যবহার করুন।")
 
     labels = options_df["label"].tolist()
-    sel = st.selectbox("Medicine *  (এখানে ক্লিক করে সরাসরি টাইপ করুন)", labels, index=None,
-                       placeholder="টাইপ করুন… যেমন Ace, Napa, Zimax", key=f"{prefix}_sel")
+    with st.container(key=f"{prefix}_wrap"):
+        sel = st.selectbox("Medicine *  (এখানে ক্লিক করে সরাসরি টাইপ করুন)", labels, index=None,
+                           placeholder="টাইপ করুন… যেমন Ace, Napa, Zimax", key=f"{prefix}_sel")
+    _inject_search_cleanup(f"{prefix}_wrap")
     name_map = dict(zip(options_df["label"], options_df["name"]))
     form_map = dict(zip(options_df["label"], options_df["form"]))
 
@@ -2041,6 +2044,132 @@ def render_opening_stock():
 # =================================================================================
 # PAGE: SALES / POS  (left: editable cart, right: billing)
 # =================================================================================
+def _inject_search_cleanup(wrap_key: str):
+    """Client-side only: as the user types into this selectbox's search box, collapse any run of
+    2+ spaces down to one and drop a leading space — so accidental double-spacing (or a stray
+    leading space) never makes an otherwise-matching medicine disappear from the list. Case is
+    already handled natively by the browser's own filtering; this only fixes spacing."""
+    js = f"""
+    <script>
+    (function() {{
+        var doc = window.parent.document;
+        var w = doc.querySelector('.st-key-{wrap_key}');
+        var el = w ? w.querySelector('input') : null;
+        if (el && !el.dataset.posCleanBound) {{
+            el.dataset.posCleanBound = '1';
+            var setter = Object.getOwnPropertyDescriptor(window.parent.HTMLInputElement.prototype, 'value').set;
+            el.addEventListener('input', function() {{
+                var v = el.value;
+                var cleaned = v.replace(/^\\s+/, '').replace(/\\s{{2,}}/g, ' ');
+                if (cleaned !== v) {{
+                    var pos = Math.max(0, el.selectionStart - (v.length - cleaned.length));
+                    setter.call(el, cleaned);
+                    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    try {{ el.setSelectionRange(pos, pos); }} catch (e2) {{}}
+                }}
+            }});
+        }}
+    }})();
+    </script>
+    """
+    components.html(js, height=0, width=0)
+
+
+def _inject_pos_shortcuts(focus_qty: bool = False, focus_search: bool = False, auto_download: bool = False):
+    """Wires up the POS keyboard shortcuts.
+
+    IMPORTANT: st.markdown(html, unsafe_allow_html=True) sets innerHTML under the hood, and per the
+    HTML spec, <script> tags inserted via innerHTML never execute — so that approach silently does
+    nothing. We use st.components.v1.html() instead, which renders in a real <iframe> where <script>
+    tags DO run; from inside that iframe we reach the actual app page via window.parent.document.
+
+    Relies on Streamlit's documented behaviour that st.container(key="xyz") renders a wrapper div
+    with CSS class '.st-key-xyz' — used to reliably find each widget's real <input>/<button> element.
+    A data-attribute guard stops the same node from getting a duplicate listener across reruns."""
+    js = f"""
+    <script>
+    (function() {{
+        var doc = window.parent.document;
+        function wrap(key) {{ return doc.querySelector('.st-key-' + key); }}
+        function inputOf(key) {{ var w = wrap(key); return w ? w.querySelector('input') : null; }}
+        function buttonOf(key) {{ var w = wrap(key); return w ? w.querySelector('button') : null; }}
+
+        if (!window.parent.__posShortcutsInstalled) {{
+            window.parent.__posShortcutsInstalled = true;
+            doc.addEventListener('keydown', function(e) {{
+                if (e.key === 'F2') {{
+                    var el = inputOf('pos_med_wrap');
+                    if (el) {{ e.preventDefault(); el.focus(); }}
+                    return;
+                }}
+                if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {{
+                    e.preventDefault();
+                    setTimeout(function() {{
+                        var btn = buttonOf('pos_checkout_wrap');
+                        if (btn && !btn.disabled) btn.click();
+                    }}, 120);
+                    return;
+                }}
+                if (e.key === 'Escape') {{
+                    var med = wrap('pos_med_wrap');
+                    if (med && med.contains(doc.activeElement)) return;  // just closing the search dropdown
+                    e.preventDefault();
+                    setTimeout(function() {{
+                        var cbtn = buttonOf('pos_clear_wrap');
+                        if (cbtn) cbtn.click();
+                    }}, 120);
+                    return;
+                }}
+            }}, true);
+        }}
+
+        var qtyEl = inputOf('pos_qty_wrap');
+        if (qtyEl && !qtyEl.dataset.posBound) {{
+            qtyEl.dataset.posBound = '1';
+            qtyEl.addEventListener('keydown', function(e) {{
+                if (e.key === 'Enter') {{
+                    e.preventDefault();
+                    var r = inputOf('pos_rate_wrap');
+                    if (r) {{ r.focus(); r.select(); }}
+                }}
+            }});
+        }}
+        var rateEl = inputOf('pos_rate_wrap');
+        if (rateEl && !rateEl.dataset.posBound) {{
+            rateEl.dataset.posBound = '1';
+            rateEl.addEventListener('keydown', function(e) {{
+                if (e.key === 'Enter') {{
+                    // Enter here also makes Streamlit commit the just-typed rate value (its own
+                    // handler fires too) — we wait a beat so that finishes before we click Add,
+                    // otherwise the click and the value-commit race each other and the click is lost.
+                    e.preventDefault();
+                    rateEl.blur();
+                    setTimeout(function() {{
+                        var a = buttonOf('pos_add_wrap');
+                        if (a) a.click();
+                    }}, 120);
+                }}
+            }});
+        }}
+
+        if ({str(focus_qty).lower()}) {{
+            var q = inputOf('pos_qty_wrap');
+            if (q) setTimeout(function() {{ q.focus(); q.select(); }}, 80);
+        }}
+        if ({str(focus_search).lower()}) {{
+            var s = inputOf('pos_med_wrap');
+            if (s) setTimeout(function() {{ s.focus(); }}, 80);
+        }}
+        if ({str(auto_download).lower()}) {{
+            var d = buttonOf('pos_voucher_dl_wrap');
+            if (d) setTimeout(function() {{ d.click(); }}, 200);
+        }}
+    }})();
+    </script>
+    """
+    components.html(js, height=0, width=0)
+
+
 def render_sales():
     if "sale_cart" not in st.session_state:
         st.session_state.sale_cart = []
@@ -2048,58 +2177,74 @@ def render_sales():
         st.session_state.last_voucher = None
     if "cart_ver" not in st.session_state:
         st.session_state.cart_ver = 0
+    if "pos_last_sel" not in st.session_state:
+        st.session_state.pos_last_sel = None
+
+    st.caption("⌨️ **কিবোর্ড শর্টকাট:** `F2` মেডিসিন সার্চ  ·  মেডিসিন বেছে `Enter`→Qty→`Enter`→Rate→`Enter` কার্টে যোগ হবে "
+              "ও কার্সার আবার সার্চে ফিরবে  ·  `Ctrl+Enter` চেকআউট + PDF  ·  `Esc` কার্ট ক্লিয়ার")
 
     meds_df = fetch_medicines()
     in_stock_df = meds_df[meds_df["stock"] > 0] if not meds_df.empty else pd.DataFrame()
     if in_stock_df.empty:
         st.warning("⚠️ No medicines currently in stock. Add stock via Purchase Entry or Opening Stock Entry.")
+        _inject_pos_shortcuts()
         return
 
     nearest_valid, expired_qty = expiry_maps()
 
-    # ---------- Row: search + product + qty + price + Add ----------
+    # ---------- Item picker: ONE native type-ahead dropdown (type letters, filters live) ----------
+    sel_changed = False
     with st.container(border=True):
         sec("Item Details")
-        colp0, colp1, colp2, colp3, colp4 = st.columns([1.6, 3, 0.8, 1, 0.8])
-        with colp0:
-            search_term = st.text_input("Search product", placeholder="type name...")
-        filtered_df = in_stock_df
-        if search_term:
-            filtered_df = in_stock_df[in_stock_df["name"].str.contains(search_term, case=False, na=False, regex=False)]
+        MAX_POS_OPTIONS = 2000
+        rows_src = in_stock_df if len(in_stock_df) <= MAX_POS_OPTIONS else in_stock_df.head(MAX_POS_OPTIONS)
+        if len(in_stock_df) > MAX_POS_OPTIONS:
+            st.caption(f"⚠️ {len(in_stock_df)}টা item stock-এ আছে — dropdown-এ প্রথম {MAX_POS_OPTIONS}টা দেখানো হচ্ছে।")
+        med_options, opt_id = [], {}
+        for nm, tp, stk, mid in zip(rows_src["name"], rows_src["medicine_type"], rows_src["stock"], rows_src["id"]):
+            lab = nm + (f" · {tp}" if tp else "") + f" · Avail: {int(stk)} pcs"
+            if expired_qty.get(nm, 0) > 0:
+                lab += " · ⛔ has expired stock"
+            elif nm in nearest_valid:
+                lab += f" · Exp {fmt_exp(nearest_valid[nm])}"
+            med_options.append(lab)
+            opt_id[lab] = mid
 
-        if filtered_df.empty:
-            st.warning("⚠️ No matching product found.")
+        with st.container(key="pos_med_wrap"):
+            selected_option = st.selectbox(
+                "Medicine  (F2 চেপে এখানে সরাসরি টাইপ করুন)", med_options, index=None,
+                placeholder="🔍 টাইপ করুন… e.g. Napa, Ace, Zimax", key="pos_med_sel")
+        _inject_search_cleanup("pos_med_wrap")
+
+        sel_changed = selected_option is not None and selected_option != st.session_state.pos_last_sel
+        st.session_state.pos_last_sel = selected_option
+
+        if selected_option is None:
+            st.info("উপরে থেকে মেডিসিন সার্চ করে বেছে নিন (F2 চাপুন)।")
         else:
-            filtered_df = filtered_df.head(300)
-            med_options = []
-            for nm, tp, stk in zip(filtered_df["name"], filtered_df["medicine_type"], filtered_df["stock"]):
-                lab = nm + (f"  ·  {tp}" if tp else "") + f"  ·  Avail: {int(stk)} pcs"
-                if expired_qty.get(nm, 0) > 0:
-                    lab += "  ·  ⛔ has expired stock"
-                elif nm in nearest_valid:
-                    lab += f"  ·  Exp {fmt_exp(nearest_valid[nm])}"
-                med_options.append(lab)
-            id_lookup = dict(zip(med_options, filtered_df["id"]))
-            with colp1:
-                selected_option = st.selectbox("Product", med_options)
-            selected_id = id_lookup[selected_option]
-            selected_row = filtered_df[filtered_df["id"] == selected_id].iloc[0]
+            selected_id = opt_id[selected_option]
+            selected_row = in_stock_df[in_stock_df["id"] == selected_id].iloc[0]
             available_stock = int(selected_row["stock"])
             default_price = float(selected_row.get("sale_price", 0) or 0)
-            with colp2:
-                add_qty = st.number_input("Qty", min_value=1, max_value=available_stock, value=1, step=1,
-                                          key=f"add_qty_{selected_id}")
-            with colp3:
-                add_price = st.number_input("Price / unit", min_value=0.0, value=default_price, step=0.5, format="%.2f",
-                                            key=f"add_price_{selected_id}")
-            with colp4:
-                spacer_line()
-                add_clicked = st.button("➕ Add", **STRETCH)
 
             n_exp = int(expired_qty.get(selected_row["name"], 0))
             if n_exp > 0:
                 st.warning(f"⛔ {n_exp} pcs of **{selected_row['name']}** are EXPIRED. Don't sell them — "
-                           "write them off from ⏰ Near Expiry Report.")
+                          "write them off from ⏰ Near Expiry Report.")
+
+            r2 = st.columns([1, 1, 1])
+            with r2[0]:
+                with st.container(key="pos_qty_wrap"):
+                    add_qty = st.number_input("Qty (Enter → Rate)", min_value=1, max_value=available_stock, value=1,
+                                              step=1, key=f"add_qty_{selected_id}")
+            with r2[1]:
+                with st.container(key="pos_rate_wrap"):
+                    add_price = st.number_input("Rate / unit (Enter → Add)", min_value=0.0, value=default_price,
+                                                step=0.5, format="%.2f", key=f"add_price_{selected_id}")
+            with r2[2]:
+                spacer_line()
+                with st.container(key="pos_add_wrap"):
+                    add_clicked = st.button("➕ Add to Cart", type="primary", **STRETCH)
 
             if add_clicked:
                 if add_price <= 0:
@@ -2115,6 +2260,9 @@ def render_sales():
                             st.session_state.sale_cart[idx].update(
                                 qty=new_qty, unit_price=float(add_price), subtotal=new_qty * float(add_price), stock=available_stock)
                             st.session_state.cart_ver += 1
+                            st.session_state.pos_last_sel = None
+                            st.session_state.pos_focus_search = True
+                            del st.session_state["pos_med_sel"]
                             st.rerun()
                     else:
                         st.session_state.sale_cart.append({
@@ -2123,11 +2271,15 @@ def render_sales():
                             "unit_price": float(add_price), "subtotal": int(add_qty) * float(add_price),
                             "cost_price": cost_price, "stock": available_stock})
                         st.session_state.cart_ver += 1
+                        st.session_state.pos_last_sel = None
+                        st.session_state.pos_focus_search = True
+                        del st.session_state["pos_med_sel"]
                         st.rerun()
 
     if not st.session_state.sale_cart:
         st.info("Cart is empty. Search and add products above.")
         _show_last_voucher()
+        _inject_pos_shortcuts(focus_qty=sel_changed, focus_search=st.session_state.pop("pos_focus_search", False))
         return
 
     cart = st.session_state.sale_cart
@@ -2171,10 +2323,11 @@ def render_sales():
                 st.caption("ℹ️ Quantity was limited to the available stock.")
             if any(it["unit_price"] <= 0 for it in new_cart):
                 st.warning("⚠️ Some items have price 0 — set a price before checkout.")
-            if st.button("🗑️ Clear Cart"):
-                st.session_state.sale_cart = []
-                st.session_state.cart_ver += 1
-                st.rerun()
+            with st.container(key="pos_clear_wrap"):
+                if st.button("🗑️ Clear Cart (Esc)"):
+                    st.session_state.sale_cart = []
+                    st.session_state.cart_ver += 1
+                    st.rerun()
 
     cart = st.session_state.sale_cart
     subtotal_amount = float(sum(it["subtotal"] for it in cart))
@@ -2256,8 +2409,10 @@ def render_sales():
             if need_cust:
                 st.warning("⚠️ Customer Name & Phone are required for Credit sales with a due amount.")
 
-            if st.button("✅ Checkout & Generate Voucher", type="primary",
-                         disabled=need_cust or bad_paid or zero_price, **STRETCH):
+            with st.container(key="pos_checkout_wrap"):
+                checkout_clicked = st.button("✅ Checkout & Generate Voucher (Ctrl+Enter)", type="primary",
+                                             disabled=need_cust or bad_paid or zero_price, **STRETCH)
+            if checkout_clicked:
                 fetch_medicines.clear()  # always check the freshest stock at checkout
                 latest = fetch_medicines()
                 stock_ok, updates = True, []
@@ -2309,11 +2464,14 @@ def render_sales():
                         st.session_state.last_voucher = sale_payload
                         st.session_state.sale_cart = []
                         st.session_state.cart_ver += 1
+                        st.session_state.pos_auto_download = True
                         if not ledger_ok:
                             st.session_state.last_voucher_warn = True
                         st.rerun()
 
     _show_last_voucher()
+    _inject_pos_shortcuts(focus_qty=sel_changed, focus_search=st.session_state.pop("pos_focus_search", False),
+                         auto_download=st.session_state.pop("pos_auto_download", False))
 
 
 def _show_last_voucher():
@@ -2329,9 +2487,10 @@ def _show_last_voucher():
         with vc1:
             st.markdown(render_voucher_html(lv), unsafe_allow_html=True)
         with vc2:
-            st.download_button(
-                "🖨️ Download / Print Voucher (PDF)", data=build_voucher_pdf(lv), file_name=f"{lv['voucher_no']}.pdf",
-                mime="application/pdf", type="primary", key="dl_last_voucher", **STRETCH)
+            with st.container(key="pos_voucher_dl_wrap"):
+                st.download_button(
+                    "🖨️ Download / Print Voucher (PDF)", data=build_voucher_pdf(lv), file_name=f"{lv['voucher_no']}.pdf",
+                    mime="application/pdf", type="primary", key="dl_last_voucher", **STRETCH)
             if st.button("✖️ Clear Voucher Preview", **STRETCH):
                 st.session_state.last_voucher = None
                 st.rerun()
