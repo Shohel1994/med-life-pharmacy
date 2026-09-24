@@ -2134,23 +2134,10 @@ def _inject_pos_shortcuts(focus_qty: bool = False, focus_search: bool = False, a
                 }}
             }});
         }}
-        var rateEl = inputOf('pos_rate_wrap');
-        if (rateEl && !rateEl.dataset.posBound) {{
-            rateEl.dataset.posBound = '1';
-            rateEl.addEventListener('keydown', function(e) {{
-                if (e.key === 'Enter') {{
-                    // Enter here also makes Streamlit commit the just-typed rate value (its own
-                    // handler fires too) — we wait a beat so that finishes before we click Add,
-                    // otherwise the click and the value-commit race each other and the click is lost.
-                    e.preventDefault();
-                    rateEl.blur();
-                    setTimeout(function() {{
-                        var a = buttonOf('pos_add_wrap');
-                        if (a) a.click();
-                    }}, 120);
-                }}
-            }});
-        }}
+        // NOTE: Rate → Add no longer needs a synthetic click here — the Rate input and the
+        // Add button live inside a real st.form(enter_to_submit=True), so pressing Enter in
+        // Rate natively submits the form. That's the browser's own behaviour, not a JS hack,
+        // so it's far more reliable than simulating a click ourselves.
 
         if ({str(focus_qty).lower()}) {{
             var q = inputOf('pos_qty_wrap');
@@ -2232,19 +2219,24 @@ def render_sales():
                 st.warning(f"⛔ {n_exp} pcs of **{selected_row['name']}** are EXPIRED. Don't sell them — "
                           "write them off from ⏰ Near Expiry Report.")
 
-            r2 = st.columns([1, 1, 1])
+            r2 = st.columns([1, 1])
             with r2[0]:
                 with st.container(key="pos_qty_wrap"):
                     add_qty = st.number_input("Qty (Enter → Rate)", min_value=1, max_value=available_stock, value=1,
                                               step=1, key=f"add_qty_{selected_id}")
             with r2[1]:
-                with st.container(key="pos_rate_wrap"):
-                    add_price = st.number_input("Rate / unit (Enter → Add)", min_value=0.0, value=default_price,
-                                                step=0.5, format="%.2f", key=f"add_price_{selected_id}")
-            with r2[2]:
-                spacer_line()
-                with st.container(key="pos_add_wrap"):
-                    add_clicked = st.button("➕ Add to Cart", type="primary", **STRETCH)
+                st.caption("Rate দিয়ে Enter চাপলেই কার্টে যোগ হবে")
+
+            with st.form(key=f"pos_add_form_{selected_id}", clear_on_submit=False, enter_to_submit=True, border=False):
+                fc1, fc2 = st.columns([1, 1])
+                with fc1:
+                    with st.container(key="pos_rate_wrap"):
+                        add_price = st.number_input("Rate / unit (Enter → Add)", min_value=0.0, value=default_price,
+                                                    step=0.5, format="%.2f", key=f"add_price_{selected_id}")
+                with fc2:
+                    spacer_line()
+                    with st.container(key="pos_add_wrap"):
+                        add_clicked = st.form_submit_button("➕ Add to Cart", type="primary", **STRETCH)
 
             if add_clicked:
                 if add_price <= 0:
